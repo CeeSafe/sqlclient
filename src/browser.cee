@@ -1,0 +1,88 @@
+// SQL Server Browser (MC-SQLR): a named instance's TCP port, asked of UDP port 1434.
+
+/// How long to wait for SQL Server Browser's answer.
+const BROWSER_TIMEOUT_MS: u64 = 2000;
+
+/// The TCP port of instance `instance` on `host`, from SQL Server Browser.
+async fn browseInstancePort(host: StringView, instance: StringView) -> Result<u16, MsSqlError> {
+    if (instance.length == 0 || instance.length > 32) {
+        return Err(MsSqlError.Config);
+    }
+    let addresses = match (await AsyncDns.resolve(host, 1434)) {
+        Ok(a) => a,
+        Err(e) => { return Err(MsSqlError.Io(e)); }
+    };
+    // CLNT_UCAST_INST: 0x04, the instance's name, NUL.
+    var request = Vector<u8>.create();
+    allocated(request.push(0x04))?;
+    allocated(request.extend(instance.bytes()))?;
+    allocated(request.push(0))?;
+    for (address in addresses.view()) {
+        let local = match (address) {
+            SocketAddress.V4(_, _) => SocketAddresses.v4Any(0),
+            SocketAddress.V6(_, _, _) => SocketAddresses.v6Any(0),
+        };
+        let socket = match (AsyncUdpSocket.bind(local, UdpOptions.defaults())) {
+            Ok(s) => s,
+            Err(_) => { continue; }
+        };
+        var answer = [0u8; 4096];
+        let got: Result<usize, MsSqlError> = await Async.timeout(
+            BROWSER_TIMEOUT_MS,
+            MsSqlError.InstanceNotFound,
+            async () => {
+                match (await socket.sendTo(request.view(), address)) {
+                    Ok() => {}
+                    Err(e) => { return Err(MsSqlError.Io(e)); }
+                }
+                match (await socket.recvFrom(mut answer[..])) {
+                    Ok(d) => { return Ok(d.length); }
+                    Err(e) => { return Err(MsSqlError.Io(e)); }
+                }
+            },
+        );
+        match (got) {
+            Ok(n) => {
+                match (instancePort(answer[0..n], instance)) {
+                    Some(port) => { return Ok(port); }
+                    null => { return Err(MsSqlError.InstanceNotFound); }
+                }
+            }
+            Err(MsSqlError.InstanceNotFound) => {}
+            Err(e) => { return Err(e); }
+        }
+    }
+    return Err(MsSqlError.InstanceNotFound);
+}
+
+/// The `tcp` port in a SVR_RESP for `instance`: 0x05, a two-byte length, then
+/// `ServerName;H;InstanceName;I;IsClustered;No;Version;16.0.1000.6;tcp;1433;;`.
+fn instancePort(answer: Slice<u8>, instance: StringView) -> u16? {
+    if (answer.length < 3 || answer[0] != 0x05) {
+        return null;
+    }
+    let text = StringView.fromUtf8(answer[3..])?;
+    // An answer may list several instances, each ended by ";;". Fields alternate key, value; `key` is the key the
+    // next value is for.
+    var matched = false;
+    var key = "";
+    var expectingValue = false;
+    for (field in text.split(";")) {
+        if (!expectingValue) {
+            if (field.length == 0) {
+                matched = false; // ";;": the next instance
+                continue;
+            }
+            key = field;
+            expectingValue = true;
+            continue;
+        }
+        expectingValue = false;
+        if (key.equalsIgnoreAsciiCase("InstanceName")) {
+            matched = field.equalsIgnoreAsciiCase(instance);
+        } else if (matched && key.equalsIgnoreAsciiCase("tcp")) {
+            return field.parseInt<u16>();
+        }
+    }
+    return null;
+}

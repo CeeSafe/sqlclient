@@ -1,0 +1,358 @@
+// Parameters for `sp_executesql` and stored procedures: each value travels typed and apart from the SQL, never
+// spliced into it.
+
+/// The most parameters SQL Server takes in one request.
+const MAX_PARAMETERS: usize = 2100;
+
+// A parameter's type (`MsParam.kind`), as it is declared and sent.
+const P_BIGINT: u8 = 1;
+const P_INT: u8 = 2;
+const P_SMALLINT: u8 = 3;
+const P_TINYINT: u8 = 4;
+const P_BIT: u8 = 5;
+const P_FLOAT: u8 = 6;
+const P_REAL: u8 = 7;
+const P_DECIMAL: u8 = 8;
+const P_NVARCHAR: u8 = 9;
+const P_VARCHAR: u8 = 10;
+const P_VARBINARY: u8 = 11;
+const P_GUID: u8 = 12;
+const P_DATE: u8 = 13;
+const P_TIME: u8 = 14;
+const P_DATETIME2: u8 = 15;
+const P_DATETIMEOFFSET: u8 = 16;
+const P_MONEY: u8 = 17;
+const P_DATETIME: u8 = 18;
+
+struct MsParam {
+    nameAt: usize;
+    nameLength: usize;
+    kind: u8;
+    output: bool;
+    isNull: bool;
+    /// The value's bytes in `values`: little-endian numbers, UTF-8 text, raw bytes, a GUID's wire bytes, a
+    /// decimal's sign and magnitude, a date's parts (see `MsSqlParams.dateParts`).
+    at: usize;
+    length: usize;
+    scale: u8;
+}
+
+/// Values for a query's `@name` placeholders, or a stored procedure's parameters, in order.
+///
+/// ```ceesafe
+/// var params = MsSqlParams.create();
+/// params.text("alice@example.org")?;              // @p1
+/// params.int64(10)?;                              // @p2
+/// let rows = await db.query("SELECT TOP (@p2) id FROM users WHERE email = @p1", params)?;
+///
+/// params.clear();
+/// params.name("@id");
+/// params.int32(7)?;                               // @id
+/// ```
+///
+/// A value without a `name` is `@p1`, `@p2`, … by its position. Names may hold letters, digits, `_`, `#`, `$` and
+/// `@`. Each value is sent with its own type: `text` as `nvarchar`, `varchar` in the server's code page (use it to
+/// compare with `varchar` columns, so the server can use their indexes), `dateTime` as `datetime2(7)`, `decimal` as
+/// `decimal(38, s)`. A `MsSqlParams` can be `clear`ed and reused, which keeps its memory.
+@noncopy
+public struct MsSqlParams {
+    private entries: Vector<MsParam>;
+    private names: Vector<u8>;
+    private values: Vector<u8>;
+    private pendingName: Vector<u8>;
+    private hasPendingName: bool;
+    private pendingOutput: bool;
+    private invalid: bool;
+
+    /// No values yet.
+    public fn create() -> MsSqlParams => MsSqlParams {
+        entries: Vector<MsParam>.create(),
+        names: Vector<u8>.create(),
+        values: Vector<u8>.create(),
+        pendingName: Vector<u8>.create(),
+        hasPendingName: false,
+        pendingOutput: false,
+        invalid: false,
+    };
+
+    /// How many values have been added.
+    public fn count(borrow this) -> usize => this.entries.length;
+
+    /// Removes every value, keeping the memory.
+    public fn clear(borrow mut this) {
+        this.entries.clear();
+        this.names.clear();
+        this.values.clear();
+        this.pendingName.clear();
+        this.hasPendingName = false;
+        this.pendingOutput = false;
+        this.invalid = false;
+    }
+
+    /// Names the next value added: `@id`, or `id` (the `@` is added). An invalid name makes that value fail with
+    /// `Config`.
+    public fn name(borrow mut this, name: StringView) {
+        this.pendingName.clear();
+        this.hasPendingName = true;
+        let b = name.bytes();
+        if (b.length == 0 || b.length > 127) {
+            this.invalid = true;
+            return;
+        }
+        for (c in b) {
+            let ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' ||
+                c == '#' || c == '$' || c == '@' || c >= 0x80;
+            if (!ok) {
+                this.invalid = true;
+                return;
+            }
+        }
+        if (b[0] != '@') {
+            if (this.pendingName.push('@').isErr()) {
+                this.invalid = true;
+                return;
+            }
+        }
+        if (this.pendingName.extend(b).isErr()) {
+            this.invalid = true;
+        }
+    }
+
+    /// Makes the next value an output parameter: the procedure (or the `sp_executesql` statement, which must say
+    /// `@name OUTPUT` too) may change it, and its last value comes back in `MsSqlResults.outputs()`. The value
+    /// added is its starting value (often `nullOf`).
+    public fn output(borrow mut this) {
+        this.pendingOutput = true;
+    }
+
+    fn add(borrow mut this, kind: u8, value: Slice<u8>, scale: u8, isNull: bool) -> Result<void, MsSqlError> {
+        if (this.invalid) {
+            this.invalid = false;
+            this.hasPendingName = false;
+            this.pendingOutput = false;
+            return Err(MsSqlError.Config);
+        }
+        if (this.entries.length >= MAX_PARAMETERS) {
+            return Err(MsSqlError.TooLarge);
+        }
+        let nameAt = this.names.length;
+        if (this.hasPendingName) {
+            allocated(this.names.extend(this.pendingName.view()))?;
+        } else {
+            allocated(this.names.extend("@p".bytes()))?;
+            allocated(pad(mut this.names, truncate<i64>(this.entries.length + 1), 1))?;
+        }
+        let at = this.values.length;
+        allocated(this.values.extend(value))?;
+        allocated(this.entries.push(MsParam {
+            nameAt: nameAt,
+            nameLength: this.names.length - nameAt,
+            kind: kind,
+            output: this.pendingOutput,
+            isNull: isNull,
+            at: at,
+            length: value.length,
+            scale: scale,
+        }))?;
+        this.hasPendingName = false;
+        this.pendingOutput = false;
+        return Ok();
+    }
+
+    /// A `bigint`.
+    public fn int64(borrow mut this, value: i64) -> Result<void, MsSqlError> {
+        var b = [0u8; 8];
+        b[..].writeLE(0, value);
+        return this.add(P_BIGINT, b[..], 0, false);
+    }
+
+    /// An `int`.
+    public fn int32(borrow mut this, value: i32) -> Result<void, MsSqlError> {
+        var b = [0u8; 4];
+        b[..].writeLE(0, value);
+        return this.add(P_INT, b[..], 0, false);
+    }
+
+    /// A `smallint`.
+    public fn int16(borrow mut this, value: i16) -> Result<void, MsSqlError> {
+        var b = [0u8; 2];
+        b[..].writeLE(0, value);
+        return this.add(P_SMALLINT, b[..], 0, false);
+    }
+
+    /// A `tinyint` (0 to 255).
+    public fn uint8(borrow mut this, value: u8) -> Result<void, MsSqlError> {
+        let b = [value];
+        return this.add(P_TINYINT, b[..], 0, false);
+    }
+
+    /// A `bit`.
+    public fn bool(borrow mut this, value: bool) -> Result<void, MsSqlError> {
+        let b = [if (value) 1u8 else 0u8];
+        return this.add(P_BIT, b[..], 0, false);
+    }
+
+    /// A `float` (8 bytes).
+    public fn float64(borrow mut this, value: f64) -> Result<void, MsSqlError> {
+        var b = [0u8; 8];
+        b[..].writeLE(0, value.bits());
+        return this.add(P_FLOAT, b[..], 0, false);
+    }
+
+    /// A `real` (4 bytes).
+    public fn float32(borrow mut this, value: f32) -> Result<void, MsSqlError> {
+        var b = [0u8; 4];
+        b[..].writeLE(0, value.bits());
+        return this.add(P_REAL, b[..], 0, false);
+    }
+
+    /// A `decimal(38, s)` with the value's scale.
+    public fn decimal(borrow mut this, value: MsDecimal) -> Result<void, MsSqlError> {
+        if (value.scale > 38 || value.digitCount() > 38) {
+            return Err(MsSqlError.TooLarge);
+        }
+        var b = [0u8; 17];
+        b[0] = if (value.negative) 0u8 else 1u8;
+        for (k in 0..4usize) {
+            b[..].writeLE(1 + k * 4, value.limbs[k]);
+        }
+        return this.add(P_DECIMAL, b[..], value.scale, false);
+    }
+
+    /// A `decimal` from text such as `-1234.50`; `Config` for text that is not one.
+    public fn decimalText(borrow mut this, value: StringView) -> Result<void, MsSqlError> {
+        match (MsDecimal.parse(value)) {
+            Some(d) => { return this.decimal(d); }
+            null => {
+                this.hasPendingName = false;
+                this.pendingOutput = false;
+                return Err(MsSqlError.Config);
+            }
+        }
+    }
+
+    /// A `money` value in ten-thousandths (`12345` is 1.2345).
+    public fn money(borrow mut this, tenThousandths: i64) -> Result<void, MsSqlError> {
+        var b = [0u8; 8];
+        b[..].writeLE(0, tenThousandths);
+        return this.add(P_MONEY, b[..], 4, false);
+    }
+
+    /// An `nvarchar(4000)`, or `nvarchar(max)` for longer text.
+    public fn text(borrow mut this, value: StringView) -> Result<void, MsSqlError> =>
+        this.add(P_NVARCHAR, value.bytes(), 0, false);
+
+    /// A `varchar(8000)` (or `varchar(max)`) in the server's default code page, for comparing with `varchar`
+    /// columns. Sending fails with `Config` if the text has a character that code page cannot hold.
+    public fn varchar(borrow mut this, value: StringView) -> Result<void, MsSqlError> =>
+        this.add(P_VARCHAR, value.bytes(), 0, false);
+
+    /// A `varbinary(8000)`, or `varbinary(max)` for more.
+    public fn bytes(borrow mut this, value: Slice<u8>) -> Result<void, MsSqlError> =>
+        this.add(P_VARBINARY, value, 0, false);
+
+    /// A `uniqueidentifier`.
+    public fn guid(borrow mut this, value: MsGuid) -> Result<void, MsSqlError> =>
+        this.add(P_GUID, value.bytes[..], 0, false);
+
+    /// A `date` (the date's time, if any, is ignored).
+    public fn date(borrow mut this, value: MsDateTime) -> Result<void, MsSqlError> {
+        if (!value.hasDate || !value.isValid()) {
+            return this.refuse();
+        }
+        let b = dateParts(value);
+        return this.add(P_DATE, b[..], 7, false);
+    }
+
+    /// A `time(7)`.
+    public fn time(borrow mut this, value: MsDateTime) -> Result<void, MsSqlError> {
+        if (!value.hasTime || !value.isValid()) {
+            return this.refuse();
+        }
+        let b = dateParts(value);
+        return this.add(P_TIME, b[..], 7, false);
+    }
+
+    /// A `datetime2(7)`, exact to 100 nanoseconds (an offset, if any, is ignored).
+    public fn dateTime(borrow mut this, value: MsDateTime) -> Result<void, MsSqlError> {
+        if (!value.hasDate || !value.isValid()) {
+            return this.refuse();
+        }
+        let b = dateParts(value);
+        return this.add(P_DATETIME2, b[..], 7, false);
+    }
+
+    /// A legacy `datetime` (1/300 s), for procedures declared with it.
+    public fn legacyDateTime(borrow mut this, value: MsDateTime) -> Result<void, MsSqlError> {
+        if (!value.hasDate || !value.isValid() || value.year < 1753) {
+            return this.refuse();
+        }
+        let b = dateParts(value);
+        return this.add(P_DATETIME, b[..], 3, false);
+    }
+
+    /// A `datetimeoffset(7)`: the value's local time and its `offsetMinutes` (UTC if it has none).
+    public fn dateTimeOffset(borrow mut this, value: MsDateTime) -> Result<void, MsSqlError> {
+        if (!value.hasDate || !value.isValid()) {
+            return this.refuse();
+        }
+        let b = dateParts(value);
+        return this.add(P_DATETIMEOFFSET, b[..], 7, false);
+    }
+
+    /// SQL NULL declared as `sqlType` (`MsSqlType.NVarChar`, `MsSqlType.Int`, …). The character, binary and decimal
+    /// types are declared at their largest, the temporal ones at scale 7.
+    public fn nullOf(borrow mut this, sqlType: MsSqlType) -> Result<void, MsSqlError> {
+        let kind: u8 = match (sqlType) {
+            MsSqlType.BigInt => P_BIGINT,
+            MsSqlType.Int => P_INT,
+            MsSqlType.SmallInt => P_SMALLINT,
+            MsSqlType.TinyInt => P_TINYINT,
+            MsSqlType.Bit => P_BIT,
+            MsSqlType.Float => P_FLOAT,
+            MsSqlType.Real => P_REAL,
+            MsSqlType.Decimal => P_DECIMAL,
+            MsSqlType.Numeric => P_DECIMAL,
+            MsSqlType.Money => P_MONEY,
+            MsSqlType.SmallMoney => P_MONEY,
+            MsSqlType.VarChar => P_VARCHAR,
+            MsSqlType.Char => P_VARCHAR,
+            MsSqlType.Text => P_VARCHAR,
+            MsSqlType.VarBinary => P_VARBINARY,
+            MsSqlType.Binary => P_VARBINARY,
+            MsSqlType.Image => P_VARBINARY,
+            MsSqlType.UniqueIdentifier => P_GUID,
+            MsSqlType.Date => P_DATE,
+            MsSqlType.Time => P_TIME,
+            MsSqlType.DateTime => P_DATETIME,
+            MsSqlType.SmallDateTime => P_DATETIME,
+            MsSqlType.DateTime2 => P_DATETIME2,
+            MsSqlType.DateTimeOffset => P_DATETIMEOFFSET,
+            _ => P_NVARCHAR,
+        };
+        return this.add(kind, [], if (kind == P_DECIMAL) 10u8 else 7u8, true);
+    }
+
+    fn refuse(borrow mut this) -> Result<void, MsSqlError> {
+        this.hasPendingName = false;
+        this.pendingOutput = false;
+        return Err(MsSqlError.Config);
+    }
+
+    fn entryList(borrow this) -> Slice<MsParam> => this.entries.view();
+
+    fn nameOf(borrow this, p: MsParam) -> Slice<u8> => this.names[p.nameAt..p.nameAt + p.nameLength];
+
+    fn valueOf(borrow this, p: MsParam) -> Slice<u8> => this.values[p.at..p.at + p.length];
+}
+
+/// A date and time as parameters keep it: days since 0001-01-01 (4 bytes), 100 ns units since midnight (8), the
+/// offset in minutes (2).
+fn dateParts(value: MsDateTime) -> [u8; 14] {
+    var b = [0u8; 14];
+    let days = if (value.hasDate) value.dayNumber() else 0i64;
+    b[..].writeLE(0, truncate<u32>(days));
+    b[..].writeLE(4, if (value.hasTime) value.ticks() else 0u64);
+    b[..].writeLE(12, if (value.hasOffset) value.offsetMinutes else 0i16);
+    return b;
+}

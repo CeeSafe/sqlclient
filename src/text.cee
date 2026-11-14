@@ -1,0 +1,259 @@
+// Text on the wire: SQL Server speaks UTF-16LE for NVARCHAR, names and SQL, and a collation's code page for VARCHAR.
+// Everything this package gives or takes is UTF-8.
+
+/// The UTF-8 encoding of `c` appended to `out`.
+fn pushUtf8(out: borrow mut Vector<u8>, c: u32) -> Result<void, AllocError> {
+    if (c < 0x80) {
+        return out.push(truncate<u8>(c));
+    }
+    if (c < 0x800) {
+        out.push(truncate<u8>(0xC0 | (c >> 6)))?;
+        return out.push(truncate<u8>(0x80 | (c & 0x3F)));
+    }
+    if (c < 0x10000) {
+        out.push(truncate<u8>(0xE0 | (c >> 12)))?;
+        out.push(truncate<u8>(0x80 | ((c >> 6) & 0x3F)))?;
+        return out.push(truncate<u8>(0x80 | (c & 0x3F)));
+    }
+    out.push(truncate<u8>(0xF0 | (c >> 18)))?;
+    out.push(truncate<u8>(0x80 | ((c >> 12) & 0x3F)))?;
+    out.push(truncate<u8>(0x80 | ((c >> 6) & 0x3F)))?;
+    return out.push(truncate<u8>(0x80 | (c & 0x3F)));
+}
+
+/// UTF-16LE to and from UTF-8.
+struct Utf16 {
+    /// How many bytes `text` takes in UTF-16.
+    fn encodedLength(text: StringView) -> usize {
+        let b = text.bytes();
+        var n: usize = 0;
+        for (x in b) {
+            // A lead byte starts a character; four-byte sequences become a surrogate pair.
+            if (x < 0x80 || x >= 0xC0) {
+                n += if (x >= 0xF0) 4usize else 2usize;
+            }
+        }
+        return n;
+    }
+
+    /// Appends `text` as UTF-16LE.
+    fn encode(text: StringView, out: borrow mut Vector<u8>) -> Result<void, AllocError> {
+        let b = text.bytes();
+        out.reserve(b.length * 2)?;
+        var i: usize = 0;
+        while (i < b.length) {
+            let lead = b[i];
+            if (lead < 0x80) {
+                out.push(lead)?;
+                out.push(0)?;
+                i += 1;
+                continue;
+            }
+            // `text` is valid UTF-8, so the sequence is complete.
+            var c: u32 = 0;
+            var n: usize = 0;
+            if (lead < 0xE0) {
+                c = (lead & 0x1F) as u32;
+                n = 2;
+            } else if (lead < 0xF0) {
+                c = (lead & 0x0F) as u32;
+                n = 3;
+            } else {
+                c = (lead & 0x07) as u32;
+                n = 4;
+            }
+            for (k in 1..n) {
+                c = (c << 6) | ((b[i + k] & 0x3F) as u32);
+            }
+            i += n;
+            if (c >= 0x10000) {
+                let v = c - 0x10000;
+                out.pushLE(truncate<u16>(0xD800 | (v >> 10)))?;
+                out.pushLE(truncate<u16>(0xDC00 | (v & 0x3FF)))?;
+            } else {
+                out.pushLE(truncate<u16>(c))?;
+            }
+        }
+        return Ok();
+    }
+
+    /// Appends UTF-16LE `bytes` to `out` as UTF-8. A lone surrogate becomes U+FFFD, as does an odd last byte.
+    fn decodeBytes(bytes: Slice<u8>, out: borrow mut Vector<u8>) -> Result<void, AllocError> {
+        out.reserve(bytes.length)?;
+        let units = bytes.length / 2;
+        var i: usize = 0;
+        while (i < units) {
+            let u = bytes.readLE<u16>(i * 2) as u32;
+            i += 1;
+            if (u < 0x80) {
+                out.push(truncate<u8>(u))?;
+            } else if (u < 0xD800 || u > 0xDFFF) {
+                pushUtf8(out, u)?;
+            } else if (u < 0xDC00 && i < units) {
+                let low = bytes.readLE<u16>(i * 2) as u32;
+                if (low >= 0xDC00 && low <= 0xDFFF) {
+                    i += 1;
+                    pushUtf8(out, 0x10000 + ((u - 0xD800) << 10) + (low - 0xDC00))?;
+                } else {
+                    pushUtf8(out, 0xFFFD)?;
+                }
+            } else {
+                pushUtf8(out, 0xFFFD)?;
+            }
+        }
+        if (bytes.length % 2 != 0) {
+            pushUtf8(out, 0xFFFD)?;
+        }
+        return Ok();
+    }
+
+    /// Appends UTF-16LE `bytes` to a `String`, a character at a time; a lone surrogate (and an odd last byte)
+    /// becomes U+FFFD.
+    fn decodeInto(bytes: Slice<u8>, out: borrow mut String) -> Result<void, AllocError> {
+        let units = bytes.length / 2;
+        var i: usize = 0;
+        while (i < units) {
+            var c = bytes.readLE<u16>(i * 2) as u32;
+            i += 1;
+            if (c >= 0xD800 && c <= 0xDBFF && i < units) {
+                let low = bytes.readLE<u16>(i * 2) as u32;
+                if (low >= 0xDC00 && low <= 0xDFFF) {
+                    i += 1;
+                    c = 0x10000 + ((c - 0xD800) << 10) + (low - 0xDC00);
+                }
+            }
+            // A surrogate left over is no scalar value: appendChar refuses it, and it becomes U+FFFD.
+            if (!out.appendChar(c)?) {
+                out.appendChar(0xFFFD)?;
+            }
+        }
+        if (bytes.length % 2 != 0) {
+            out.appendChar(0xFFFD)?;
+        }
+        return Ok();
+    }
+}
+
+/// A collation's code page, from its five TDS bytes (MS-TDS 2.2.5.1.2): a SQL collation by its sort id, a UTF-8
+/// collation (`_UTF8`) as 65001, else the Windows collation's LCID. 1252 when it cannot be told.
+fn collationCodePage(b: Slice<u8>) -> u16 {
+    if (b.length < 5) {
+        return 1252;
+    }
+    let sort = b[4] as usize;
+    if (sort != 0) {
+        let c = SORT_CODE_PAGES[sort];
+        return if (c == 0) 1252u16 else c;
+    }
+    if ((b[3] & 0x04) != 0) {
+        return 65001;
+    }
+    let lcid = (b[0] as u32) | ((b[1] as u32) << 8) | (((b[2] & 0x0F) as u32) << 16);
+    for (k in 1..128usize) {
+        if (FAMILY_LCIDS[k] == lcid && FAMILY_CODE_PAGES[k] != 0) {
+            return FAMILY_CODE_PAGES[k];
+        }
+    }
+    for (k in 1..128usize) {
+        if ((FAMILY_LCIDS[k] & 0xFFFF) == (lcid & 0xFFFF) && FAMILY_CODE_PAGES[k] != 0) {
+            return FAMILY_CODE_PAGES[k];
+        }
+    }
+    return 1252;
+}
+
+/// The single-byte code pages and UTF-8.
+struct CodePages {
+    /// Whether text in code page `cp` is converted exactly (the double-byte Asian pages are not).
+    fn supported(cp: u16) -> bool =>
+        cp == 65001 || cp == 437 || cp == 850 || cp == 874 || (cp >= 1250 && cp <= 1258);
+
+    /// Byte `b` of single-byte code page `cp` as a character.
+    fn toUnicode(cp: u16, b: u8) -> u32 {
+        if (b < 0x80) {
+            return b as u32;
+        }
+        let i = (b - 0x80) as usize;
+        return (match (cp) {
+            437u16 => CP437_HIGH[i],
+            850u16 => CP850_HIGH[i],
+            874u16 => CP874_HIGH[i],
+            1250u16 => CP1250_HIGH[i],
+            1251u16 => CP1251_HIGH[i],
+            1253u16 => CP1253_HIGH[i],
+            1254u16 => CP1254_HIGH[i],
+            1255u16 => CP1255_HIGH[i],
+            1256u16 => CP1256_HIGH[i],
+            1257u16 => CP1257_HIGH[i],
+            1258u16 => CP1258_HIGH[i],
+            _ => CP1252_HIGH[i],
+        }) as u32;
+    }
+
+    /// Appends UTF-8 `text` in code page `cp`; false (with `out` partly written) when the page has no byte for one
+    /// of its characters. A double-byte page takes ASCII only.
+    fn encode(cp: u16, text: Slice<u8>, out: borrow mut Vector<u8>) -> Result<bool, AllocError> {
+        if (cp == 65001) {
+            out.extend(text)?;
+            return Ok(true);
+        }
+        let exact = CodePages.supported(cp);
+        var i: usize = 0;
+        while (i < text.length) {
+            let lead = text[i];
+            if (lead < 0x80) {
+                out.push(lead)?;
+                i += 1;
+                continue;
+            }
+            if (!exact) {
+                return Ok(false);
+            }
+            let n: usize = if (lead < 0xE0) 2usize else (if (lead < 0xF0) 3usize else 4usize);
+            var c: u32 =
+                if (n == 2) (lead & 0x1F) as u32 else (if (n == 3) (lead & 0x0F) as u32 else (lead & 0x07) as u32);
+            for (k in 1..n) {
+                c = (c << 6) | ((text[i + k] & 0x3F) as u32);
+            }
+            i += n;
+            var found = false;
+            for (b in 0x80..0x100usize) {
+                if (CodePages.toUnicode(cp, truncate<u8>(b)) == c) {
+                    out.push(truncate<u8>(b))?;
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) {
+                return Ok(false);
+            }
+        }
+        return Ok(true);
+    }
+
+    /// Appends `bytes`, text in code page `cp`, to `out` as UTF-8. Invalid UTF-8 (in a UTF-8 collation), and the
+    /// non-ASCII bytes of a double-byte page, become U+FFFD.
+    fn decode(cp: u16, bytes: Slice<u8>, out: borrow mut Vector<u8>) -> Result<void, AllocError> {
+        if (cp == 65001) {
+            if (StringView.fromUtf8(bytes) != null) {
+                return out.extend(bytes);
+            }
+            for (b in bytes) {
+                pushUtf8(out, if (b < 0x80) b as u32 else 0xFFFD)?;
+            }
+            return Ok();
+        }
+        out.reserve(bytes.length)?;
+        let exact = CodePages.supported(cp);
+        for (b in bytes) {
+            if (b < 0x80) {
+                out.push(b)?;
+            } else if (exact) {
+                pushUtf8(out, CodePages.toUnicode(cp, b))?;
+            } else {
+                pushUtf8(out, 0xFFFD)?;
+            }
+        }
+        return Ok();
+    }
+}

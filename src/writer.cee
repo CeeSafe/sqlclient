@@ -1,0 +1,381 @@
+// Request messages: SQLBatch (MS-TDS 2.2.6.7) and RPC (2.2.6.6), each after its ALL_HEADERS (2.2.5.3).
+
+/// `sp_executesql`'s procedure id.
+const PROC_EXECUTESQL: u16 = 10;
+/// The most bytes a non-(MAX) nvarchar, varchar or varbinary value holds.
+const SHORT_VALUE: usize = 8000;
+
+/// ALL_HEADERS with the transaction descriptor header: the open transaction's descriptor, one outstanding request.
+fn putAllHeaders(out: borrow mut Vector<u8>, descriptor: u64) -> Result<void, AllocError> {
+    out.pushLE(22u32)?;
+    out.pushLE(18u32)?;
+    out.pushLE(0x0002u16)?;
+    out.pushLE(descriptor)?;
+    return out.pushLE(1u32);
+}
+
+/// A SQLBatch: the headers, then the SQL in UTF-16.
+fn putSqlBatch(out: borrow mut Vector<u8>, sql: StringView, descriptor: u64) -> Result<void, AllocError> {
+    out.clear();
+    putAllHeaders(out, descriptor)?;
+    return Utf16.encode(sql, out);
+}
+
+/// What `putParam` needs of the session: the collation text parameters carry, and its code page.
+struct SessionText {
+    collation: [u8; 5];
+    codePage: u16;
+}
+
+/// A parameter's name as a B_VARCHAR: its UTF-16 length in one byte, then UTF-16.
+fn putParamName(out: borrow mut Vector<u8>, name: Slice<u8>) -> Result<void, MsSqlError> {
+    let text = StringView.fromUtf8(name) ?? "";
+    let units = Utf16.encodedLength(text) / 2;
+    if (units > 255) {
+        return Err(MsSqlError.TooLarge);
+    }
+    allocated(out.push(truncate<u8>(units)))?;
+    return allocated(Utf16.encode(text, out));
+}
+
+/// An unnamed nvarchar input parameter holding `text` (sp_executesql's statement and declarations).
+fn putUnnamedText(out: borrow mut Vector<u8>, text: StringView, session: SessionText) -> Result<void, MsSqlError> {
+    allocated(out.push(0))?; // no name
+    allocated(out.push(0))?; // input
+    return putTextValue(out, text, session, false);
+}
+
+/// TYPE_INFO and value of an nvarchar holding `text`: nvarchar(4000) when it fits, else nvarchar(max) as PLP.
+fn putTextValue(
+    out: borrow mut Vector<u8>,
+    text: StringView,
+    session: SessionText,
+    isNull: bool,
+) -> Result<void, MsSqlError> {
+    let length = Utf16.encodedLength(text);
+    let long = !isNull && length > SHORT_VALUE;
+    allocated(out.push(0xE7))?;
+    allocated(out.pushLE(if (long) 0xFFFFu16 else 8000u16))?;
+    allocated(out.extend(session.collation[..]))?;
+    if (isNull) {
+        return allocated(out.pushLE(0xFFFFu16));
+    }
+    if (long) {
+        allocated(out.pushLE(length as u64))?;
+        if (length > 0xFFFFFFFF) {
+            return Err(MsSqlError.TooLarge);
+        }
+        allocated(out.pushLE(truncate<u32>(length)))?;
+        allocated(Utf16.encode(text, out))?;
+        return allocated(out.pushLE(0u32));
+    }
+    allocated(out.pushLE(truncate<u16>(length)))?;
+    return allocated(Utf16.encode(text, out));
+}
+
+/// A byte value of type `wire` (varchar 0xA7 with a collation, varbinary 0xA5 without): 8000 when it fits, else
+/// (max) as PLP.
+fn putBytesValue(
+    out: borrow mut Vector<u8>,
+    wire: u8,
+    bytes: Slice<u8>,
+    session: SessionText,
+    isNull: bool,
+) -> Result<void, MsSqlError> {
+    let long = !isNull && bytes.length > SHORT_VALUE;
+    allocated(out.push(wire))?;
+    allocated(out.pushLE(if (long) 0xFFFFu16 else 8000u16))?;
+    if (wire == 0xA7) {
+        allocated(out.extend(session.collation[..]))?;
+    }
+    if (isNull) {
+        return allocated(out.pushLE(0xFFFFu16));
+    }
+    if (long) {
+        if (bytes.length > 0xFFFFFFFF) {
+            return Err(MsSqlError.TooLarge);
+        }
+        allocated(out.pushLE(bytes.length as u64))?;
+        allocated(out.pushLE(truncate<u32>(bytes.length)))?;
+        allocated(out.extend(bytes))?;
+        return allocated(out.pushLE(0u32));
+    }
+    allocated(out.pushLE(truncate<u16>(bytes.length)))?;
+    return allocated(out.extend(bytes));
+}
+
+/// One parameter: name, status, TYPE_INFO, value.
+fn putParam(
+    out: borrow mut Vector<u8>,
+    params: borrow MsSqlParams,
+    p: MsParam,
+    session: SessionText,
+    scratch: borrow mut Vector<u8>,
+) -> Result<void, MsSqlError> {
+    putParamName(out, params.nameOf(p))?;
+    allocated(out.push(if (p.output) 0x01u8 else 0x00u8))?;
+    let v = params.valueOf(p);
+    let k = p.kind;
+    if (k == P_BIGINT || k == P_INT || k == P_SMALLINT || k == P_TINYINT) {
+        let size: u8 = if (k == P_BIGINT) 8u8 else (if (k == P_INT) 4u8 else (if (k == P_SMALLINT) 2u8 else 1u8));
+        return putFixed(out, 0x26, size, v, p.isNull);
+    }
+    if (k == P_BIT) {
+        return putFixed(out, 0x68, 1, v, p.isNull);
+    }
+    if (k == P_FLOAT || k == P_REAL) {
+        return putFixed(out, 0x6D, if (k == P_FLOAT) 8u8 else 4u8, v, p.isNull);
+    }
+    if (k == P_GUID) {
+        return putFixed(out, 0x24, 16, v, p.isNull);
+    }
+    if (k == P_MONEY) {
+        allocated(out.push(0x6E))?;
+        allocated(out.push(8))?;
+        if (p.isNull) {
+            return allocated(out.push(0));
+        }
+        let units = truncate<u64>(v.readLE<i64>(0));
+        allocated(out.push(8))?;
+        allocated(out.pushLE(truncate<u32>(units >> 32)))?;
+        return allocated(out.pushLE(truncate<u32>(units)));
+    }
+    if (k == P_DECIMAL) {
+        allocated(out.push(0x6A))?;
+        allocated(out.push(17))?;
+        allocated(out.push(38))?;
+        allocated(out.push(p.scale))?;
+        if (p.isNull) {
+            return allocated(out.push(0));
+        }
+        allocated(out.push(17))?;
+        return allocated(out.extend(v));
+    }
+    if (k == P_NVARCHAR) {
+        // Text was UTF-8 when it was added.
+        return putTextValue(out, StringView.fromUtf8(v) ?? "", session, p.isNull);
+    }
+    if (k == P_VARCHAR) {
+        scratch.clear();
+        if (!p.isNull && !allocated2(CodePages.encode(session.codePage, v, scratch))?) {
+            return Err(MsSqlError.Config); // a character the server's code page cannot hold
+        }
+        return putBytesValue(out, 0xA7, scratch.view(), session, p.isNull);
+    }
+    if (k == P_VARBINARY) {
+        return putBytesValue(out, 0xA5, v, session, p.isNull);
+    }
+    // The temporal types, from dateParts: days (4), 100 ns units (8), offset minutes (2).
+    let days = if (p.isNull) 0u64 else v.readLE<u32>(0) as u64;
+    let ticks = if (p.isNull) 0u64 else v.readLE<u64>(4);
+    let offset = if (p.isNull) 0i64 else v.readLE<i16>(12) as i64;
+    if (k == P_DATE) {
+        allocated(out.push(0x28))?;
+        if (p.isNull) {
+            return allocated(out.push(0));
+        }
+        allocated(out.push(3))?;
+        return putLittle(out, days, 3);
+    }
+    if (k == P_TIME) {
+        allocated(out.push(0x29))?;
+        allocated(out.push(7))?;
+        if (p.isNull) {
+            return allocated(out.push(0));
+        }
+        allocated(out.push(5))?;
+        return putLittle(out, ticks, 5);
+    }
+    if (k == P_DATETIME2) {
+        allocated(out.push(0x2A))?;
+        allocated(out.push(7))?;
+        if (p.isNull) {
+            return allocated(out.push(0));
+        }
+        allocated(out.push(8))?;
+        putLittle(out, ticks, 5)?;
+        return putLittle(out, days, 3);
+    }
+    if (k == P_DATETIMEOFFSET) {
+        allocated(out.push(0x2B))?;
+        allocated(out.push(7))?;
+        if (p.isNull) {
+            return allocated(out.push(0));
+        }
+        // The wire holds UTC: local time minus the offset.
+        let perDay: i64 = 864000000000;
+        var utc = truncate<i64>(ticks) - offset * 600000000;
+        var day = truncate<i64>(days);
+        if (utc < 0) {
+            utc += perDay;
+            day -= 1;
+        } else if (utc >= perDay) {
+            utc -= perDay;
+            day += 1;
+        }
+        if (day < 0) {
+            return Err(MsSqlError.Config);
+        }
+        allocated(out.push(10))?;
+        putLittle(out, truncate<u64>(utc), 5)?;
+        putLittle(out, truncate<u64>(day), 3)?;
+        return allocated(out.pushLE(truncate<i16>(offset)));
+    }
+    if (k == P_DATETIME) {
+        allocated(out.push(0x6F))?;
+        allocated(out.push(8))?;
+        if (p.isNull) {
+            return allocated(out.push(0));
+        }
+        // Days since 1900, then 1/300 seconds, rounded to the nearest.
+        var day = truncate<i64>(days) - DAYS_0001_TO_1900;
+        var t300 = (ticks * 3 + 50000) / 100000;
+        if (t300 >= 25920000) {
+            t300 -= 25920000;
+            day += 1;
+        }
+        allocated(out.push(8))?;
+        allocated(out.pushLE(truncate<i32>(day)))?;
+        return allocated(out.pushLE(truncate<u32>(t300)));
+    }
+    return Err(MsSqlError.Config);
+}
+
+fn allocated2(outcome: Result<bool, AllocError>) -> Result<bool, MsSqlError> {
+    match (outcome) {
+        Ok(b) => { return Ok(b); }
+        Err(_) => { return Err(MsSqlError.OutOfMemory); }
+    }
+}
+
+/// A BYTELEN type of maximum length `size`, and its value (`size` bytes, or 0 for NULL).
+fn putFixed(
+    out: borrow mut Vector<u8>,
+    wire: u8,
+    size: u8,
+    value: Slice<u8>,
+    isNull: bool,
+) -> Result<void, MsSqlError> {
+    allocated(out.push(wire))?;
+    allocated(out.push(size))?;
+    if (isNull) {
+        return allocated(out.push(0));
+    }
+    allocated(out.push(size))?;
+    return allocated(out.extend(value[0..size as usize]));
+}
+
+/// The low `count` bytes of `v`, little-endian.
+fn putLittle(out: borrow mut Vector<u8>, v: u64, count: usize) -> Result<void, MsSqlError> {
+    for (k in 0..count) {
+        allocated(out.push(truncate<u8>(v >> truncate<u64>(k * 8))))?;
+    }
+    return Ok();
+}
+
+/// The parameters' declarations for sp_executesql: `@p1 bigint,@id nvarchar(4000) output`.
+fn appendDeclarations(params: borrow MsSqlParams, out: borrow mut Vector<u8>) -> Result<void, AllocError> {
+    var first = true;
+    for (p in params.entryList()) {
+        if (!first) {
+            out.push(',')?;
+        }
+        first = false;
+        out.extend(params.nameOf(p))?;
+        out.push(' ')?;
+        let v = params.valueOf(p);
+        let k = p.kind;
+        if (k == P_BIGINT) {
+            out.extend("bigint".bytes())?;
+        } else if (k == P_INT) {
+            out.extend("int".bytes())?;
+        } else if (k == P_SMALLINT) {
+            out.extend("smallint".bytes())?;
+        } else if (k == P_TINYINT) {
+            out.extend("tinyint".bytes())?;
+        } else if (k == P_BIT) {
+            out.extend("bit".bytes())?;
+        } else if (k == P_FLOAT) {
+            out.extend("float".bytes())?;
+        } else if (k == P_REAL) {
+            out.extend("real".bytes())?;
+        } else if (k == P_MONEY) {
+            out.extend("money".bytes())?;
+        } else if (k == P_DECIMAL) {
+            out.extend("decimal(38,".bytes())?;
+            pad(out, p.scale as i64, 1)?;
+            out.push(')')?;
+        } else if (k == P_NVARCHAR) {
+            let long = Utf16.encodedLength(StringView.fromUtf8(v) ?? "") > SHORT_VALUE;
+            out.extend(if (long) "nvarchar(max)".bytes() else "nvarchar(4000)".bytes())?;
+        } else if (k == P_VARCHAR) {
+            out.extend(if (v.length > SHORT_VALUE) "varchar(max)".bytes() else "varchar(8000)".bytes())?;
+        } else if (k == P_VARBINARY) {
+            out.extend(if (v.length > SHORT_VALUE) "varbinary(max)".bytes() else "varbinary(8000)".bytes())?;
+        } else if (k == P_GUID) {
+            out.extend("uniqueidentifier".bytes())?;
+        } else if (k == P_DATE) {
+            out.extend("date".bytes())?;
+        } else if (k == P_TIME) {
+            out.extend("time(7)".bytes())?;
+        } else if (k == P_DATETIME2) {
+            out.extend("datetime2(7)".bytes())?;
+        } else if (k == P_DATETIMEOFFSET) {
+            out.extend("datetimeoffset(7)".bytes())?;
+        } else if (k == P_DATETIME) {
+            out.extend("datetime".bytes())?;
+        }
+        if (p.output) {
+            out.extend(" output".bytes())?;
+        }
+    }
+    return Ok();
+}
+
+/// An RPC calling sp_executesql with `sql` and `params`.
+fn putExecuteSql(
+    out: borrow mut Vector<u8>,
+    sql: StringView,
+    params: borrow MsSqlParams,
+    descriptor: u64,
+    session: SessionText,
+) -> Result<void, MsSqlError> {
+    out.clear();
+    allocated(putAllHeaders(out, descriptor))?;
+    allocated(out.pushLE(0xFFFFu16))?; // a procedure by id
+    allocated(out.pushLE(PROC_EXECUTESQL))?;
+    allocated(out.pushLE(0u16))?; // option flags
+    putUnnamedText(out, sql, session)?;
+    var declarations = Vector<u8>.create();
+    allocated(appendDeclarations(params, mut declarations))?;
+    putUnnamedText(out, StringView.fromUtf8(declarations.view()) ?? "", session)?;
+    var scratch = Vector<u8>.create();
+    for (p in params.entryList()) {
+        putParam(out, params, p, session, mut scratch)?;
+    }
+    return Ok();
+}
+
+/// An RPC calling stored procedure `name` (`dbo.GetOrders`, `[my proc]`) with `params` by name.
+fn putProcedureCall(
+    out: borrow mut Vector<u8>,
+    name: StringView,
+    params: borrow MsSqlParams,
+    descriptor: u64,
+    session: SessionText,
+) -> Result<void, MsSqlError> {
+    out.clear();
+    let units = Utf16.encodedLength(name) / 2;
+    if (units == 0 || units > 0xFFFE) {
+        return Err(MsSqlError.Config);
+    }
+    allocated(putAllHeaders(out, descriptor))?;
+    allocated(out.pushLE(truncate<u16>(units)))?;
+    allocated(Utf16.encode(name, out))?;
+    allocated(out.pushLE(0u16))?; // option flags
+    var scratch = Vector<u8>.create();
+    for (p in params.entryList()) {
+        putParam(out, params, p, session, mut scratch)?;
+    }
+    return Ok();
+}

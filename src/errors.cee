@@ -1,0 +1,167 @@
+import tls.TlsError;
+import tls.TlsErrors;
+
+/// What went wrong in a SQL Server operation.
+public enum MsSqlError {
+    /// The socket failed, or the operation was cancelled.
+    Io(AsyncError),
+    /// TLS failed: the handshake, the server's certificate, or the session afterwards.
+    Tls(TlsError),
+    OutOfMemory,
+    /// The configuration asks for encryption and the server cannot encrypt, or the server requires encryption and
+    /// the configuration turned it off.
+    EncryptionRefused,
+    /// The server refused the login (error 18456 and the like); `MsSqlConnection.lastError()` has its message.
+    Login,
+    /// The login needs an authentication method this client does not have (NTLM without a user name and password,
+    /// Kerberos, Entra ID).
+    UnsupportedAuthentication,
+    /// The server reported one or more errors; `MsSqlConnection.errors()` has them, `lastError()` the first. The
+    /// connection is usable again.
+    Server,
+    /// The server sent something this client did not expect, or a malformed packet.
+    Protocol,
+    /// The server closed the connection.
+    Closed,
+    /// An earlier operation on this connection was cancelled or failed partway, so the stream is out of step: drop
+    /// the connection (or try `recover()`).
+    Broken,
+    /// A connection string could not be read, or a value in it, or a parameter, is out of range.
+    Config,
+    /// A query, parameter or value is larger than the protocol allows.
+    TooLarge,
+    /// The command timeout ran out. The server was told to stop (an attention), so the connection is usable again
+    /// unless the timeout struck while the request was still being sent (then it is `Broken`).
+    TimedOut,
+    /// SQL Server Browser did not answer for the named instance, or does not know it.
+    InstanceNotFound,
+    /// The operation needs a state the connection is not in: `fetch` without a query started, `commit` without a
+    /// transaction, another query while a streamed one is unfinished.
+    WrongState,
+}
+
+/// Words for `MsSqlError`s.
+public struct MsSqlErrors {
+    /// A short English description of `error`. For `Server` and `Login`, the server's own message is in
+    /// `lastError()`.
+    public fn describe(error: MsSqlError) -> StringView {
+        match (error) {
+            MsSqlError.Io(AsyncError.Cancelled) => { return "the operation was cancelled"; }
+            MsSqlError.Io(AsyncError.TimedOut) => { return "the network timed out"; }
+            MsSqlError.Io(_) => { return "socket error"; }
+            MsSqlError.Tls(_) => { return "TLS error"; }
+            MsSqlError.OutOfMemory => { return "out of memory"; }
+            MsSqlError.EncryptionRefused => { return "the server and the configuration disagree on encryption"; }
+            MsSqlError.Login => { return "the server refused the login"; }
+            MsSqlError.UnsupportedAuthentication => { return "unsupported authentication method"; }
+            MsSqlError.Server => { return "the server reported an error"; }
+            MsSqlError.Protocol => { return "protocol error"; }
+            MsSqlError.Closed => { return "the server closed the connection"; }
+            MsSqlError.Broken => { return "the connection is out of step after an earlier failure"; }
+            MsSqlError.Config => { return "invalid setting or parameter"; }
+            MsSqlError.TooLarge => { return "query or value too large"; }
+            MsSqlError.TimedOut => { return "the command timed out"; }
+            MsSqlError.InstanceNotFound => { return "the named instance was not found"; }
+            MsSqlError.WrongState => { return "the connection is not in a state for this operation"; }
+        }
+    }
+}
+
+impl MsSqlErrors {
+    /// Appends `describe(error)` to `out`, with what is known beyond it: OpenSSL's reason for a TLS failure (and,
+    /// for a certificate that did not verify, how to accept a development server's), the system's for a socket.
+    public fn explain(error: MsSqlError, out: borrow mut String) -> Result<void, AllocError> {
+        out.append(MsSqlErrors.describe(error))?;
+        match (error) {
+            MsSqlError.Tls(t) => {
+                var buffer = [0u8; 256];
+                let n = TlsErrors.describe(t, mut buffer[..]);
+                out.append(": ")?;
+                out.append(StringView.fromUtf8(buffer[0..n]) ?? "")?;
+                if (t is TlsError.Verify(_)) {
+                    out.append(
+                        " (the server's certificate was not accepted; TrustServerCertificate=true skips the check, for development servers only)",
+                    )?;
+                }
+            }
+            MsSqlError.Io(AsyncError.Io(e)) => {
+                out.append(": ")?;
+                out.append(e.message())?;
+            }
+            _ => {}
+        }
+        return Ok();
+    }
+}
+
+fn allocated(outcome: Result<void, AllocError>) -> Result<void, MsSqlError> {
+    match (outcome) {
+        Ok() => { return Ok(); }
+        Err(_) => { return Err(MsSqlError.OutOfMemory); }
+    }
+}
+
+/// An ERROR or INFO message from the server (MS-TDS 2.2.7.10, 2.2.7.13): a `RAISERROR`, a `PRINT`, a constraint
+/// violation, a login failure.
+@noncopy
+public struct MsSqlMessage {
+    /// The error number: 2627 a unique key violation, 1205 a deadlock victim, 18456 a failed login, 0 for `PRINT`.
+    public number: u32;
+    public state: u8;
+    /// 0 to 10 informational, 11 to 16 the user's errors, 17 and above resource or system errors (20 and above end
+    /// the connection).
+    public severity: u8;
+    public message: String;
+    public server: String;
+    /// The stored procedure or trigger it was raised in, or empty.
+    public procedure: String;
+    public line: u32;
+
+    fn create() -> MsSqlMessage => MsSqlMessage {
+        number: 0,
+        state: 0,
+        severity: 0,
+        message: String.create(),
+        server: String.create(),
+        procedure: String.create(),
+        line: 0,
+    };
+}
+
+/// A B_VARCHAR (a count of UTF-16 code units in one byte, then the text) at `at`, decoded into `out`; the position
+/// after it, or null when it runs past `end`.
+fn readBVarchar(body: Slice<u8>, at: usize, end: usize, out: borrow mut String) -> Result<usize?, MsSqlError> {
+    if (at >= end) {
+        return Ok(null);
+    }
+    let units = body[at] as usize;
+    let stop = at + 1 + units * 2;
+    if (stop > end) {
+        return Ok(null);
+    }
+    allocated(Utf16.decodeInto(body[at + 1..stop], mut out))?;
+    return Ok(Some(stop));
+}
+
+/// Decodes an ERROR or INFO token's body (after its two-byte length).
+fn parseMessage(body: Slice<u8>) -> Result<MsSqlMessage, MsSqlError> {
+    var m = MsSqlMessage.create();
+    if (body.length < 8) {
+        return Err(MsSqlError.Protocol);
+    }
+    m.number = body.readLE<u32>(0);
+    m.state = body[4];
+    m.severity = body[5];
+    let units = body.readLE<u16>(6) as usize;
+    let textEnd = 8 + units * 2;
+    if (textEnd > body.length) {
+        return Err(MsSqlError.Protocol);
+    }
+    allocated(Utf16.decodeInto(body[8..textEnd], mut m.message))?;
+    var at = readBVarchar(body, textEnd, body.length, mut m.server)? ?? { return Err(MsSqlError.Protocol); };
+    at = readBVarchar(body, at, body.length, mut m.procedure)? ?? { return Err(MsSqlError.Protocol); };
+    if (at + 4 <= body.length) {
+        m.line = body.readLE<u32>(at);
+    }
+    return Ok(m);
+}

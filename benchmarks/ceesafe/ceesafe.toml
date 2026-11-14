@@ -1,0 +1,7 @@
+[package]
+name = "bench"
+kind = "executable"
+ceesafec = ">=0.47.1"
+
+[dependencies]
+sqlclient = { path = "../.." }

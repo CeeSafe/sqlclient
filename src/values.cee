@@ -1,0 +1,564 @@
+// SQL Server's value types that have no CeeSafe counterpart: exact decimals, dates and times, GUIDs.
+
+/// A column's SQL Server type, as the server describes it.
+public enum MsSqlType {
+    /// A column of NULLs (`SELECT NULL`).
+    Null,
+    TinyInt,
+    SmallInt,
+    Int,
+    BigInt,
+    Bit,
+    Real,
+    Float,
+    Decimal,
+    Numeric,
+    Money,
+    SmallMoney,
+    Date,
+    Time,
+    DateTime,
+    SmallDateTime,
+    DateTime2,
+    DateTimeOffset,
+    UniqueIdentifier,
+    Char,
+    VarChar,
+    Text,
+    NChar,
+    NVarChar,
+    NText,
+    Binary,
+    VarBinary,
+    Image,
+    /// `rowversion`, eight bytes.
+    Timestamp,
+    Xml,
+    /// A CLR type: `geography`, `geometry`, `hierarchyid` or one of the database's own, as its serialized bytes.
+    Udt,
+    /// `sql_variant`: each value carries its own type.
+    Variant,
+}
+
+/// Words for `MsSqlType`s.
+public struct MsSqlTypes {
+    /// The type's name as T-SQL writes it, in lower case (`nvarchar`, `datetime2`).
+    public fn name(t: MsSqlType) -> StringView => match (t) {
+        MsSqlType.Null => "null",
+        MsSqlType.TinyInt => "tinyint",
+        MsSqlType.SmallInt => "smallint",
+        MsSqlType.Int => "int",
+        MsSqlType.BigInt => "bigint",
+        MsSqlType.Bit => "bit",
+        MsSqlType.Real => "real",
+        MsSqlType.Float => "float",
+        MsSqlType.Decimal => "decimal",
+        MsSqlType.Numeric => "numeric",
+        MsSqlType.Money => "money",
+        MsSqlType.SmallMoney => "smallmoney",
+        MsSqlType.Date => "date",
+        MsSqlType.Time => "time",
+        MsSqlType.DateTime => "datetime",
+        MsSqlType.SmallDateTime => "smalldatetime",
+        MsSqlType.DateTime2 => "datetime2",
+        MsSqlType.DateTimeOffset => "datetimeoffset",
+        MsSqlType.UniqueIdentifier => "uniqueidentifier",
+        MsSqlType.Char => "char",
+        MsSqlType.VarChar => "varchar",
+        MsSqlType.Text => "text",
+        MsSqlType.NChar => "nchar",
+        MsSqlType.NVarChar => "nvarchar",
+        MsSqlType.NText => "ntext",
+        MsSqlType.Binary => "binary",
+        MsSqlType.VarBinary => "varbinary",
+        MsSqlType.Image => "image",
+        MsSqlType.Timestamp => "timestamp",
+        MsSqlType.Xml => "xml",
+        MsSqlType.Udt => "udt",
+        MsSqlType.Variant => "sql_variant",
+    };
+}
+
+/// An exact decimal: up to 38 digits, `scale` of them after the point, as SQL Server's `decimal`, `numeric` and
+/// `money` hold them. The magnitude is four 32-bit limbs, the lowest first.
+public struct MsDecimal {
+    public negative: bool;
+    public limbs: [u32; 4];
+    public scale: u8;
+
+    /// The value `units / 10^scale`.
+    public fn ofInt(units: i64, scale: u8) -> MsDecimal {
+        let m = units.unsignedAbs();
+        return MsDecimal {
+            negative: units < 0,
+            limbs: [truncate<u32>(m), truncate<u32>(m >> 32), 0, 0],
+            scale: scale,
+        };
+    }
+
+    /// Reads `-123.4500`, `+7`, `.5` or `1e3`-free decimal text; null for anything else, for more than 38 digits,
+    /// or a scale over 38.
+    public fn parse(text: StringView) -> MsDecimal? {
+        let b = text.trim().bytes();
+        var d = MsDecimal { negative: false, limbs: [0u32; 4], scale: 0 };
+        var i: usize = 0;
+        if (i < b.length && (b[i] == '-' || b[i] == '+')) {
+            d.negative = b[i] == '-';
+            i += 1;
+        }
+        var digits: usize = 0;
+        var seenPoint = false;
+        var any = false;
+        while (i < b.length) {
+            let c = b[i];
+            i += 1;
+            if (c == '.' && !seenPoint) {
+                seenPoint = true;
+                continue;
+            }
+            if (c < '0' || c > '9') {
+                return null;
+            }
+            any = true;
+            if (digits > 0 || c != '0') {
+                digits += 1;
+            }
+            if (digits > 38) {
+                return null;
+            }
+            d.mulAdd(10, (c - '0') as u32);
+            if (seenPoint) {
+                d.scale += 1;
+                if (d.scale > 38) {
+                    return null;
+                }
+            }
+        }
+        if (!any) {
+            return null;
+        }
+        return d;
+    }
+
+    /// this = this * m + a.
+    fn mulAdd(borrow mut this, m: u32, a: u32) {
+        var carry = a as u64;
+        for (k in 0..4usize) {
+            let v = (this.limbs[k] as u64) * (m as u64) + carry;
+            this.limbs[k] = truncate<u32>(v);
+            carry = v >> 32;
+        }
+    }
+
+    /// this = this / d; gives the remainder.
+    fn divSmall(borrow mut this, d: u32) -> u32 {
+        var rem: u64 = 0;
+        var k: usize = 4;
+        while (k > 0) {
+            k -= 1;
+            let v = (rem << 32) | (this.limbs[k] as u64);
+            this.limbs[k] = truncate<u32>(v / (d as u64));
+            rem = v % (d as u64);
+        }
+        return truncate<u32>(rem);
+    }
+
+    fn isZero(borrow this) -> bool =>
+        this.limbs[0] == 0 && this.limbs[1] == 0 && this.limbs[2] == 0 && this.limbs[3] == 0;
+
+    /// Appends the value as decimal text with exactly `scale` digits after the point (`-12.50`, `0.001`, `7`).
+    public fn write(borrow this, out: borrow mut Vector<u8>) -> Result<void, AllocError> {
+        // At most 39 digits.
+        var digits = [0u8; 40];
+        var n: usize = 0;
+        var m = *this;
+        while (!m.isZero()) {
+            digits[n] = '0' + truncate<u8>(m.divSmall(10));
+            n += 1;
+        }
+        let scale = this.scale as usize;
+        while (n <= scale) {
+            digits[n] = '0';
+            n += 1;
+        }
+        if (this.negative && !this.isZero()) {
+            out.push('-')?;
+        }
+        var k = n;
+        while (k > 0) {
+            k -= 1;
+            out.push(digits[k])?;
+            if (k == scale && scale > 0) {
+                out.push('.')?;
+            }
+        }
+        return Ok();
+    }
+
+    /// Appends the value's text to a `String`.
+    public fn writeText(borrow this, out: borrow mut String) -> Result<void, AllocError> {
+        var bytes = Vector<u8>.create();
+        this.write(mut bytes)?;
+        let _ = out.appendUtf8(bytes.view())?;
+        return Ok();
+    }
+
+    /// The value as the nearest `f64`.
+    public fn toFloat64(borrow this) -> f64 {
+        var v: f64 = 0.0;
+        var k: usize = 4;
+        while (k > 0) {
+            k -= 1;
+            v = v * 4294967296.0 + round<f64>(this.limbs[k]);
+        }
+        for (s in 0..this.scale as usize) {
+            v = v / 10.0;
+        }
+        return if (this.negative) -v else v;
+    }
+
+    /// The value as an `i64` when it is a whole number in range, else null.
+    public fn toInt64(borrow this) -> i64? {
+        var m = *this;
+        for (s in 0..this.scale as usize) {
+            if (m.divSmall(10) != 0) {
+                return null;
+            }
+        }
+        if (m.limbs[2] != 0 || m.limbs[3] != 0) {
+            return null;
+        }
+        let mag = ((m.limbs[1] as u64) << 32) | (m.limbs[0] as u64);
+        if (this.negative) {
+            if (mag > 0x8000000000000000) {
+                return null;
+            }
+            if (mag == 0x8000000000000000) {
+                return -9223372036854775807 - 1;
+            }
+            return 0 - checkedTruncate<i64>(mag)!;
+        }
+        return checkedTruncate<i64>(mag);
+    }
+
+    /// The same value with `scale` digits after the point; null when that would drop digits that are not zero or
+    /// pass 38 digits.
+    public fn rescaled(borrow this, scale: u8) -> MsDecimal? {
+        var m = *this;
+        while (m.scale < scale) {
+            if (m.limbs[3] >= 0x19999999) {
+                return null;
+            }
+            m.mulAdd(10, 0);
+            m.scale += 1;
+        }
+        while (m.scale > scale) {
+            if (m.divSmall(10) != 0) {
+                return null;
+            }
+            m.scale -= 1;
+        }
+        return m;
+    }
+
+    /// How many decimal digits the magnitude has (at least 1).
+    fn digitCount(borrow this) -> u8 {
+        var m = *this;
+        var n: u8 = 0;
+        while (!m.isZero()) {
+            let r = m.divSmall(10);
+            n += 1;
+        }
+        return if (n == 0) 1u8 else n;
+    }
+}
+
+/// A date, a time of day, or both, with an offset from UTC when the type has one. A `date` has no time
+/// (`hasTime` false); a `time` has no date (`hasDate` false); only `datetimeoffset` has an offset.
+///
+/// A `datetimeoffset`'s fields are its local time: `2024-05-01 10:00:00 +02:00` is hour 10 with `offsetMinutes`
+/// 120 (the instant is 08:00 UTC).
+public struct MsDateTime {
+    public year: i32;
+    public month: u8;
+    public day: u8;
+    public hour: u8;
+    public minute: u8;
+    public second: u8;
+    /// Nanoseconds within the second (SQL Server keeps 100-nanosecond units).
+    public nanos: u32;
+    public offsetMinutes: i16;
+    public hasDate: bool;
+    public hasTime: bool;
+    public hasOffset: bool;
+
+    /// A date and a time without an offset (`datetime2`).
+    public fn of(year: i32, month: u8, day: u8, hour: u8, minute: u8, second: u8, nanos: u32) -> MsDateTime =>
+        MsDateTime {
+            year: year,
+            month: month,
+            day: day,
+            hour: hour,
+            minute: minute,
+            second: second,
+            nanos: nanos,
+            offsetMinutes: 0,
+            hasDate: true,
+            hasTime: true,
+            hasOffset: false,
+        };
+
+    /// A date alone (`date`).
+    public fn date(year: i32, month: u8, day: u8) -> MsDateTime {
+        var d = MsDateTime.of(year, month, day, 0, 0, 0, 0);
+        d.hasTime = false;
+        return d;
+    }
+
+    /// A time of day alone (`time`).
+    public fn time(hour: u8, minute: u8, second: u8, nanos: u32) -> MsDateTime {
+        var d = MsDateTime.of(1, 1, 1, hour, minute, second, nanos);
+        d.hasDate = false;
+        return d;
+    }
+
+    /// The same local date and time `offsetMinutes` from UTC (`datetimeoffset`).
+    public fn withOffset(borrow this, offsetMinutes: i16) -> MsDateTime {
+        var d = *this;
+        d.offsetMinutes = offsetMinutes;
+        d.hasOffset = true;
+        d.hasDate = true;
+        d.hasTime = true;
+        return d;
+    }
+
+    /// The instant `unixMillis` (milliseconds since 1970, UTC) as a UTC date and time.
+    public fn fromUnixMillis(unixMillis: i64) -> MsDateTime {
+        var days = unixMillis / 86400000;
+        var ms = unixMillis % 86400000;
+        if (ms < 0) {
+            ms += 86400000;
+            days -= 1;
+        }
+        var d = civilFromDays(days + DAYS_0001_TO_1970);
+        d.hour = truncate<u8>(ms / 3600000);
+        d.minute = truncate<u8>((ms / 60000) % 60);
+        d.second = truncate<u8>((ms / 1000) % 60);
+        d.nanos = truncate<u32>((ms % 1000) * 1000000);
+        d.hasTime = true;
+        return d;
+    }
+
+    /// Whether the fields are a real date and time (month 1 to 12, a day the month has, hour below 24, …).
+    public fn isValid(borrow this) -> bool {
+        if (this.hasDate) {
+            if (this.year < 1 || this.year > 9999 || this.month < 1 || this.month > 12) {
+                return false;
+            }
+            if (this.day < 1 || this.day > daysInMonth(this.year, this.month)) {
+                return false;
+            }
+        }
+        if (this.hasTime) {
+            if (this.hour > 23 || this.minute > 59 || this.second > 59 || this.nanos > 999999999) {
+                return false;
+            }
+        }
+        if (this.hasOffset && (this.offsetMinutes < -840 || this.offsetMinutes > 840)) {
+            return false;
+        }
+        return true;
+    }
+
+    /// Days since 0001-01-01.
+    fn dayNumber(borrow this) -> i64 => daysFromCivil(this.year, this.month, this.day);
+
+    /// 100-nanosecond units since midnight.
+    fn ticks(borrow this) -> u64 =>
+        ((this.hour as u64) * 3600 + (this.minute as u64) * 60 + (this.second as u64)) * 10000000 +
+            (this.nanos as u64) / 100;
+
+    /// Appends ISO 8601 text: `2024-05-01T10:00:00.1234567+02:00`, `2024-05-01` for a date, `10:00:00` for a time.
+    /// The fraction has as many digits as it needs (none, 3, or 7).
+    public fn write(borrow this, out: borrow mut Vector<u8>) -> Result<void, AllocError> {
+        if (this.hasDate) {
+            pad(out, this.year as i64, 4)?;
+            out.push('-')?;
+            pad(out, this.month as i64, 2)?;
+            out.push('-')?;
+            pad(out, this.day as i64, 2)?;
+        }
+        if (this.hasTime) {
+            if (this.hasDate) {
+                out.push('T')?;
+            }
+            pad(out, this.hour as i64, 2)?;
+            out.push(':')?;
+            pad(out, this.minute as i64, 2)?;
+            out.push(':')?;
+            pad(out, this.second as i64, 2)?;
+            if (this.nanos != 0) {
+                out.push('.')?;
+                if (this.nanos % 1000000 == 0) {
+                    pad(out, (this.nanos / 1000000) as i64, 3)?;
+                } else {
+                    pad(out, (this.nanos / 100) as i64, 7)?;
+                }
+            }
+        }
+        if (this.hasOffset) {
+            if (this.offsetMinutes == 0) {
+                out.push('Z')?;
+            } else {
+                let m = this.offsetMinutes as i64;
+                out.push(if (m < 0) '-' else '+')?;
+                let a = if (m < 0) 0 - m else m;
+                pad(out, a / 60, 2)?;
+                out.push(':')?;
+                pad(out, a % 60, 2)?;
+            }
+        }
+        return Ok();
+    }
+
+    /// Appends the ISO 8601 text to a `String`.
+    public fn writeText(borrow this, out: borrow mut String) -> Result<void, AllocError> {
+        var bytes = Vector<u8>.create();
+        this.write(mut bytes)?;
+        let _ = out.appendUtf8(bytes.view())?;
+        return Ok();
+    }
+}
+
+/// A `uniqueidentifier`'s 16 bytes, in the order SQL Server sends them: the first three groups little-endian.
+public struct MsGuid {
+    public bytes: [u8; 16];
+
+    /// Reads `6F9619FF-8B86-D011-B42D-00C04FC964FF` (any case, braces allowed); null for other text.
+    public fn parse(text: StringView) -> MsGuid? {
+        let all = text.trim().bytes();
+        let braced = all.length == 38 && all[0] == '{' && all[37] == '}';
+        let t = if (braced) all[1..37] else all;
+        if (t.length != 36 || t[8] != '-' || t[13] != '-' || t[18] != '-' || t[23] != '-') {
+            return null;
+        }
+        // Text order to wire order: the first three groups are reversed.
+        let order = [3usize, 2, 1, 0, 5, 4, 7, 6, 8, 9, 10, 11, 12, 13, 14, 15];
+        var g = MsGuid { bytes: [0u8; 16] };
+        var at: usize = 0;
+        for (k in 0..16usize) {
+            if (at == 8 || at == 13 || at == 18 || at == 23) {
+                at += 1;
+            }
+            let hi = hexValue(t[at])?;
+            let lo = hexValue(t[at + 1])?;
+            g.bytes[order[k]] = (hi << 4) | lo;
+            at += 2;
+        }
+        return g;
+    }
+
+    /// Appends the canonical text, upper case as SQL Server shows it: `6F9619FF-8B86-D011-B42D-00C04FC964FF`.
+    public fn write(borrow this, out: borrow mut Vector<u8>) -> Result<void, AllocError> {
+        let order = [3usize, 2, 1, 0, 5, 4, 7, 6, 8, 9, 10, 11, 12, 13, 14, 15];
+        let hex = "0123456789ABCDEF".bytes();
+        for (k in 0..16usize) {
+            if (k == 4 || k == 6 || k == 8 || k == 10) {
+                out.push('-')?;
+            }
+            let b = this.bytes[order[k]];
+            out.push(hex[(b >> 4) as usize])?;
+            out.push(hex[(b & 0x0F) as usize])?;
+        }
+        return Ok();
+    }
+
+    /// Appends the canonical text to a `String`.
+    public fn writeText(borrow this, out: borrow mut String) -> Result<void, AllocError> {
+        var bytes = Vector<u8>.create();
+        this.write(mut bytes)?;
+        let _ = out.appendUtf8(bytes.view())?;
+        return Ok();
+    }
+}
+
+fn hexValue(c: u8) -> u8? {
+    if (c >= '0' && c <= '9') {
+        return c - '0';
+    }
+    if (c >= 'a' && c <= 'f') {
+        return c - 'a' + 10;
+    }
+    if (c >= 'A' && c <= 'F') {
+        return c - 'A' + 10;
+    }
+    return null;
+}
+
+/// `n` in decimal, zero-padded to `width` digits.
+fn pad(out: borrow mut Vector<u8>, n: i64, width: usize) -> Result<void, AllocError> {
+    var digits = [0u8; 20];
+    var count: usize = 0;
+    var v = n.unsignedAbs();
+    if (n < 0) {
+        out.push('-')?;
+    }
+    while (v > 0 || count == 0) {
+        digits[count] = '0' + truncate<u8>(v % 10);
+        count += 1;
+        v = v / 10;
+    }
+    while (count < width) {
+        digits[count] = '0';
+        count += 1;
+    }
+    while (count > 0) {
+        count -= 1;
+        out.push(digits[count])?;
+    }
+    return Ok();
+}
+
+/// Days from 0001-01-01 to 1970-01-01.
+const DAYS_0001_TO_1970: i64 = 719162;
+/// Days from 0001-01-01 to 1900-01-01, the epoch of `datetime` and `smalldatetime`.
+const DAYS_0001_TO_1900: i64 = 693595;
+
+fn isLeap(y: i32) -> bool => (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
+
+fn daysInMonth(y: i32, m: u8) -> u8 {
+    if (m == 2) {
+        return if (isLeap(y)) 29u8 else 28u8;
+    }
+    if (m == 4 || m == 6 || m == 9 || m == 11) {
+        return 30;
+    }
+    return 31;
+}
+
+/// Days since 0001-01-01 of a proleptic Gregorian date (Howard Hinnant's algorithm).
+fn daysFromCivil(year: i32, month: u8, day: u8) -> i64 {
+    let y = (year as i64) - (if (month <= 2) 1i64 else 0i64);
+    let era = (if (y >= 0) y else y - 399) / 400;
+    let yoe = y - era * 400;
+    let m = month as i64;
+    let mp = if (m > 2) m - 3 else m + 9;
+    let doy = (153 * mp + 2) / 5 + (day as i64) - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    // era * 146097 + doe counts from 0000-03-01; 0001-01-01 is day 306 of that count.
+    return era * 146097 + doe - 306;
+}
+
+/// The date `days` after 0001-01-01.
+fn civilFromDays(days: i64) -> MsDateTime {
+    let z = days + 306;
+    let era = (if (z >= 0) z else z - 146096) / 146097;
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if (mp < 10) mp + 3 else mp - 9;
+    let y = yoe + era * 400 + (if (m <= 2) 1i64 else 0i64);
+    return MsDateTime.date(truncate<i32>(y), truncate<u8>(m), truncate<u8>(d));
+}

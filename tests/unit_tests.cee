@@ -1,0 +1,531 @@
+// Tests that need no server: hashes and NTLMv2, text, values, connection strings, the token decoder and the
+// request writer.
+
+fn hexOf(bytes: Slice<u8>) -> String {
+    var out = String.create();
+    let digits = "0123456789abcdef";
+    for (b in bytes) {
+        out.append(digits[(b >> 4) as usize..(b >> 4) as usize + 1])!;
+        out.append(digits[(b & 15) as usize..(b & 15) as usize + 1])!;
+    }
+    return out;
+}
+
+fn utf16(text: StringView, out: borrow mut Vector<u8>) {
+    Utf16.encode(text, out)!;
+}
+
+// ── Hashes and NTLM ──────────────────────────────────────────────────────────────────────────────────────────
+
+@test
+fn md4KnownAnswers() -> Result<void, TestFailure> {
+    // RFC 1320 §A.5
+    Check.equalText("31d6cfe0d16ae931b73c59d7e0c089c0", hexOf(md4("".bytes())[..]).view())?;
+    Check.equalText("bde52cb31de33e46245e05fbdbd6fb24", hexOf(md4("a".bytes())[..]).view())?;
+    Check.equalText("a448017aaf21d8525fc10ae87aa6729d", hexOf(md4("abc".bytes())[..]).view())?;
+    let long = "12345678901234567890123456789012345678901234567890123456789012345678901234567890";
+    Check.equalText("e33b4ddc9c38f2199c3e7b164fcc0536", hexOf(md4(long.bytes())[..]).view())?;
+    return Ok();
+}
+
+@test
+fn hmacMd5KnownAnswers() -> Result<void, TestFailure> {
+    // RFC 2202 test cases 1 and 2
+    let key = [0x0Bu8; 16];
+    Check.equalText("9294727a3638bb1c13f48ef8158bfc9d", hexOf(hmacMd5(key[..], "Hi There".bytes())[..]).view())?;
+    Check.equalText(
+        "750c783e6ab0b503eaa86e310a5db738",
+        hexOf(hmacMd5("Jefe".bytes(), "what do ya want for nothing?".bytes())[..]).view(),
+    )?;
+    return Ok();
+}
+
+@test
+fn ntlmV2MatchesTheSpecification() -> Result<void, TestFailure> {
+    // MS-NLMP §4.2.4: User / Domain / Password, server challenge 0123456789abcdef, client challenge aa…, time 0, and
+    // target information naming the domain "Domain" and the computer "Server".
+    var info = Vector<u8>.create();
+    info.pushLE(2u16)!;
+    info.pushLE(12u16)!;
+    utf16("Domain", mut info);
+    info.pushLE(1u16)!;
+    info.pushLE(12u16)!;
+    utf16("Server", mut info);
+    info.pushLE(0u32)!;
+    var challenge = NtlmChallenge {
+        flags: 0,
+        challenge: [0x01u8, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF],
+        infoAt: 0,
+        infoLength: 0,
+        timestamp: 0,
+    };
+    let client = [0xAAu8; 8];
+    var nt = Vector<u8>.create();
+    var lm = Vector<u8>.create();
+    ntlmV2Responses("User", "Domain", "Password", challenge, info.view(), client[..], 0, mut nt, mut lm)!;
+    Check.equalText("68cd0ab851e51c96aabc927bebef6a1c", hexOf(nt.view()[0..16]).view())?;
+    Check.equalText("86c35097ac9cec102554764a57cccc19aaaaaaaaaaaaaaaa", hexOf(lm.view()).view())?;
+    challenge.flags = 0;
+    return Ok();
+}
+
+@test
+fn ntlmChallengeIsRead() -> Result<void, TestFailure> {
+    // A CHALLENGE message: signature, type 2, target name (empty), flags, challenge, reserved, target info.
+    var m = Vector<u8>.create();
+    m.extend(NTLM_SIGNATURE[..])!;
+    m.pushLE(2u32)!;
+    m.pushLE(0u16)!;
+    m.pushLE(0u16)!;
+    m.pushLE(48u32)!;
+    m.pushLE(0xA2890205u32)!;
+    m.extend([1u8, 2, 3, 4, 5, 6, 7, 8][..])!;
+    m.pushLE(0u64)!;
+    m.pushLE(16u16)!; // target info: a timestamp pair (12 bytes) and EOL (4)
+    m.pushLE(16u16)!;
+    m.pushLE(48u32)!;
+    m.pushLE(7u16)!;
+    m.pushLE(8u16)!;
+    m.pushLE(0x01D9000000000000u64)!;
+    m.pushLE(0u32)!;
+    let c = parseNtlmChallenge(m.view())!;
+    Check.equalU64(0xA2890205, c.flags as u64)?;
+    Check.equalU64(8, c.challenge[7] as u64)?;
+    Check.equalU64(16, c.infoLength as u64)?;
+    Check.equalU64(0x01D9000000000000, c.timestamp)?;
+    var out = Vector<u8>.create();
+    ntlmAuthenticate(m.view(), "user", "CORP", "secret", "WS", mut out)!;
+    Check.equalU64(3, out.view().readLE<u32>(8) as u64)?;
+    Check.equalU64(24, out.view().readLE<u16>(12) as u64)?; // LM: 24 zeros, as the server sent its time
+    return Ok();
+}
+
+// ── Text ─────────────────────────────────────────────────────────────────────────────────────────────────────
+
+@test
+fn utf16RoundTrips() -> Result<void, TestFailure> {
+    let text = "héllo, 世界 😀";
+    var wire = Vector<u8>.create();
+    utf16(text, mut wire);
+    Check.equalU64(Utf16.encodedLength(text) as u64, wire.length as u64)?;
+    Check.equalU64(0xD83D, wire.view().readLE<u16>(wire.length - 4) as u64)?; // the emoji's surrogate pair
+    var back = Vector<u8>.create();
+    Utf16.decodeBytes(wire.view(), mut back)!;
+    Check.equalBytes(text.bytes(), back.view())?;
+    // A lone surrogate is U+FFFD.
+    let lone = [0x00u8, 0xD8, 0x41, 0x00];
+    back.clear();
+    Utf16.decodeBytes(lone[..], mut back)!;
+    Check.equalBytes("\u{FFFD}A".bytes(), back.view())?;
+    return Ok();
+}
+
+@test
+fn codePagesConvert() -> Result<void, TestFailure> {
+    let latin = [0x63u8, 0x61, 0x66, 0xE9, 0x80]; // "café€" in 1252
+    var out = Vector<u8>.create();
+    CodePages.decode(1252, latin[..], mut out)!;
+    Check.equalBytes("café€".bytes(), out.view())?;
+    var back = Vector<u8>.create();
+    Check.isTrue(CodePages.encode(1252, "café€".bytes(), mut back)!, "encodable")?;
+    Check.equalBytes(latin[..], back.view())?;
+    back.clear();
+    Check.isFalse(CodePages.encode(1252, "世".bytes(), mut back)!, "not in 1252")?;
+    // SQL_Latin1_General_CP1_CI_AS (sort id 52), Cyrillic_General_CI_AS (LCID 0x419), a _UTF8 collation.
+    Check.equalU64(1252, collationCodePage([0x09u8, 0x04, 0xD0, 0x00, 0x34][..]) as u64)?;
+    Check.equalU64(1251, collationCodePage([0x19u8, 0x04, 0xD0, 0x00, 0x00][..]) as u64)?;
+    Check.equalU64(65001, collationCodePage([0x09u8, 0x04, 0xD0, 0x04, 0x00][..]) as u64)?;
+    return Ok();
+}
+
+// ── Values ───────────────────────────────────────────────────────────────────────────────────────────────────
+
+fn decimalText(d: MsDecimal) -> String {
+    var s = String.create();
+    d.writeText(mut s)!;
+    return s;
+}
+
+@test
+fn decimalsParseAndPrint() -> Result<void, TestFailure> {
+    Check.equalText("-123.4500", decimalText(MsDecimal.parse("-123.4500")!).view())?;
+    Check.equalText("0.001", decimalText(MsDecimal.parse(".001")!).view())?;
+    Check.equalText("7", decimalText(MsDecimal.parse("+7")!).view())?;
+    let big = "99999999999999999999999999999999999999";
+    Check.equalText(big, decimalText(MsDecimal.parse(big)!).view())?;
+    Check.isTrue(MsDecimal.parse("999999999999999999999999999999999999999") == null, "39 digits")?;
+    Check.isTrue(MsDecimal.parse("1e5") == null, "no exponents")?;
+    Check.isTrue(MsDecimal.parse("") == null, "empty")?;
+    Check.equalI64(-42, MsDecimal.parse("-42.000")!.toInt64()!)?;
+    Check.isTrue(MsDecimal.parse("1.5")!.toInt64() == null, "not whole")?;
+    Check.equalText("1.50", decimalText(MsDecimal.parse("1.5")!.rescaled(2)!).view())?;
+    Check.isTrue(MsDecimal.parse("1.25")!.rescaled(1) == null, "would round")?;
+    Check.isTrue(MsDecimal.parse("2.5")!.toFloat64() == 2.5, "float")?;
+    Check.equalText("-0.0001", decimalText(MsDecimal.ofInt(-1, 4)).view())?;
+    return Ok();
+}
+
+fn dateText(d: MsDateTime) -> String {
+    var s = String.create();
+    d.writeText(mut s)!;
+    return s;
+}
+
+@test
+fn datesConvert() -> Result<void, TestFailure> {
+    Check.equalI64(693595, daysFromCivil(1900, 1, 1))?;
+    Check.equalI64(719162, daysFromCivil(1970, 1, 1))?;
+    Check.equalI64(0, daysFromCivil(1, 1, 1))?;
+    let leap = civilFromDays(daysFromCivil(2000, 2, 29));
+    Check.equalText("2000-02-29", dateText(leap).view())?;
+    let last = civilFromDays(daysFromCivil(9999, 12, 31));
+    Check.equalText("9999-12-31", dateText(last).view())?;
+    let t = MsDateTime.fromUnixMillis(1714559400123);
+    Check.equalText("2024-05-01T10:30:00.123", dateText(t).view())?;
+    let o = MsDateTime.of(2024, 5, 1, 10, 0, 0, 100).withOffset(-330);
+    Check.equalText("2024-05-01T10:00:00.0000001-05:30", dateText(o).view())?;
+    Check.isFalse(MsDateTime.of(2023, 2, 29, 0, 0, 0, 0).isValid(), "no Feb 29 in 2023")?;
+    return Ok();
+}
+
+@test
+fn guidsRoundTrip() -> Result<void, TestFailure> {
+    let g = MsGuid.parse("{6F9619FF-8B86-D011-B42D-00C04FC964FF}")!;
+    Check.equalU64(0xFF, g.bytes[0] as u64)?; // the first group is little-endian on the wire
+    Check.equalU64(0x6F, g.bytes[3] as u64)?;
+    Check.equalU64(0xB4, g.bytes[8] as u64)?;
+    var s = String.create();
+    g.writeText(mut s)!;
+    Check.equalText("6F9619FF-8B86-D011-B42D-00C04FC964FF", s.view())?;
+    Check.isTrue(MsGuid.parse("6F9619FF-8B86-D011-B42D-00C04FC964F") == null, "short")?;
+    return Ok();
+}
+
+// ── Connection strings ───────────────────────────────────────────────────────────────────────────────────────
+
+@test
+fn adoNetStringsParse() -> Result<void, TestFailure> {
+    let c = MsSqlConfig.parse(
+        "Server=tcp:db.example.org,1444; Initial Catalog=shop;User ID=app;Password='se;cr''et';Encrypt=strict;TrustServerCertificate=yes;Application Name=billing;Connect Timeout=5;Command Timeout=0;Packet Size=16384;ApplicationIntent=ReadOnly",
+    ).ok()!;
+    Check.equalText("db.example.org", c.host())?;
+    Check.equalU64(1444, c.port() as u64)?;
+    Check.equalText("shop", c.database())?;
+    Check.equalText("app", c.user())?;
+    Check.equalText("se;cr'et", c.password())?;
+    Check.isTrue(c.encrypt() is MsEncrypt.Strict, "strict")?;
+    Check.isTrue(c.trustsServerCertificate(), "trusted")?;
+    Check.equalText("billing", c.applicationName())?;
+    Check.equalU64(5000, c.connectTimeout())?;
+    Check.equalU64(0, c.commandTimeout())?;
+    Check.equalU64(16384, c.packetSize() as u64)?;
+    Check.isTrue(c.readOnlyIntent(), "read-only intent")?;
+    return Ok();
+}
+
+@test
+fn serverFormsParse() -> Result<void, TestFailure> {
+    let named = MsSqlConfig.parse("Data Source=sql01\\SALES;Database=x;Integrated Security=SSPI;Domain=CORP")!;
+    Check.equalText("sql01", named.host())?;
+    Check.equalText("SALES", named.instance())?;
+    Check.equalU64(0, named.port() as u64)?; // found through SQL Server Browser
+    Check.isTrue(named.usesWindowsLogin(), "windows")?;
+    let local = MsSqlConfig.parse("Server=(local);Database=x")!;
+    Check.equalText("localhost", local.host())?;
+    Check.equalU64(1433, local.port() as u64)?;
+    Check.isTrue(local.encrypt() is MsEncrypt.Mandatory, "encrypted by default")?;
+    let v6 = MsSqlConfig.parse("Server=[::1],1500;Encrypt=false")!;
+    Check.equalText("::1", v6.host())?;
+    Check.equalU64(1500, v6.port() as u64)?;
+    Check.isTrue(v6.encrypt() is MsEncrypt.Optional, "optional")?;
+    let url = MsSqlConfig.parse("sqlserver://app:p%40ss@db:1555/INST?database=shop&TrustServerCertificate=true")!;
+    Check.equalText("db", url.host())?;
+    Check.equalU64(1555, url.port() as u64)?;
+    Check.equalText("INST", url.instance())?;
+    Check.equalText("p@ss", url.password())?;
+    Check.equalText("shop", url.database())?;
+    return Ok();
+}
+
+@test
+fn badStringsFail() -> Result<void, TestFailure> {
+    Check.isTrue(MsSqlConfig.parse("Database=x").isErr(), "no server")?;
+    Check.isTrue(MsSqlConfig.parse("Server=a,99999").isErr(), "port out of range")?;
+    Check.isTrue(MsSqlConfig.parse("Server=a;Password='open").isErr(), "unclosed quote")?;
+    Check.isTrue(MsSqlConfig.parse("Server=a;Encrypt=maybe").isErr(), "bad bool")?;
+    Check.isTrue(MsSqlConfig.parse("Server=np:\\\\.\\pipe\\sql").isErr(), "named pipes")?;
+    return Ok();
+}
+
+// ── The login ────────────────────────────────────────────────────────────────────────────────────────────────
+
+@test
+fn preLoginRoundTrips() -> Result<void, TestFailure> {
+    var request = Vector<u8>.create();
+    buildPreLogin(ENCRYPT_ON, "", mut request)!;
+    let answer = parsePreLogin(request.view())!;
+    Check.equalU64(ENCRYPT_ON as u64, answer.encryption as u64)?;
+    Check.equalU64(0x10, answer.major as u64)?;
+    Check.isTrue(parsePreLogin([0x01u8, 0x00, 0x20, 0x00, 0x01][..]).isErr(), "past the end")?;
+    return Ok();
+}
+
+@test
+fn login7IsLaidOut() -> Result<void, TestFailure> {
+    let fields = LoginFields {
+        hostName: "ws",
+        userName: "sa",
+        password: "ab",
+        appName: "app",
+        serverName: "db",
+        language: "",
+        database: "master",
+        sspi: [],
+        packetSize: 8000,
+        readOnlyIntent: false,
+    };
+    var out = Vector<u8>.create();
+    buildLogin7(fields, mut out)!;
+    let b = out.view();
+    Check.equalU64(b.length as u64, b.readLE<u32>(0) as u64)?;
+    Check.equalU64(0x74000004, b.readLE<u32>(4) as u64)?;
+    Check.equalU64(0x03, b[25] as u64)?; // ODBC and INIT_LANG_FATAL
+    let passwordAt = b.readLE<u16>(44) as usize;
+    Check.equalU64(2, b.readLE<u16>(46) as u64)?;
+    // 'a' is 0x61 0x00: nibbles swapped then XOR 0xA5.
+    Check.equalU64(0xB3, b[passwordAt] as u64)?;
+    Check.equalU64(0xA5, b[passwordAt + 1] as u64)?;
+    return Ok();
+}
+
+@test
+fn browserAnswersAreRead() -> Result<void, TestFailure> {
+    var answer = Vector<u8>.create();
+    answer.push(0x05)!;
+    answer.pushLE(0u16)!;
+    answer.extend("ServerName;H;InstanceName;OTHER;IsClustered;No;Version;16.0;tcp;50000;;".bytes())!;
+    answer.extend("ServerName;H;InstanceName;SALES;IsClustered;No;Version;16.0;tcp;51433;;".bytes())!;
+    Check.equalU64(51433, instancePort(answer.view(), "sales")! as u64)?;
+    Check.isTrue(instancePort(answer.view(), "none") == null, "unknown instance")?;
+    return Ok();
+}
+
+// ── Decoding ─────────────────────────────────────────────────────────────────────────────────────────────────
+
+fn columnHeader(out: borrow mut Vector<u8>, wire: u8) {
+    out.pushLE(0u32)!; // user type
+    out.pushLE(1u16)!; // nullable
+    out.push(wire)!;
+}
+
+fn columnName(out: borrow mut Vector<u8>, name: StringView) {
+    out.push(truncate<u8>(name.length))!;
+    utf16(name, out);
+}
+
+/// COLMETADATA for id int, name nvarchar(50), price decimal(10,2), at datetime2(7), ok bit, big nvarchar(max).
+fn sampleMetadata() -> Vector<u8> {
+    var m = Vector<u8>.create();
+    m.pushLE(6u16)!;
+    columnHeader(mut m, 0x26);
+    m.push(4)!;
+    columnName(mut m, "id");
+    columnHeader(mut m, 0xE7);
+    m.pushLE(100u16)!;
+    m.extend([0x09u8, 0x04, 0xD0, 0x00, 0x34][..])!;
+    columnName(mut m, "name");
+    columnHeader(mut m, 0x6A);
+    m.extend([5u8, 10, 2][..])!;
+    columnName(mut m, "price");
+    columnHeader(mut m, 0x2A);
+    m.push(7)!;
+    columnName(mut m, "at");
+    columnHeader(mut m, 0x68);
+    m.push(1)!;
+    columnName(mut m, "ok");
+    columnHeader(mut m, 0xE7);
+    m.pushLE(0xFFFFu16)!;
+    m.extend([0x09u8, 0x04, 0xD0, 0x00, 0x34][..])!;
+    columnName(mut m, "big");
+    return m;
+}
+
+fn sampleRow(out: borrow mut Vector<u8>) {
+    out.push(4)!;
+    out.pushLE(42i32)!;
+    var name = Vector<u8>.create();
+    utf16("Zoë", mut name);
+    out.pushLE(truncate<u16>(name.length))!;
+    out.extend(name.view())!;
+    out.push(5)!;
+    out.push(1)!;
+    out.pushLE(12345u32)!;
+    out.push(8)!;
+    let ticks: u64 = (10 * 3600 + 30 * 60) * 10000000;
+    for (k in 0..5usize) {
+        out.push(truncate<u8>(ticks >> truncate<u64>(k * 8)))!;
+    }
+    let days = truncate<u64>(daysFromCivil(2024, 5, 1));
+    for (k in 0..3usize) {
+        out.push(truncate<u8>(days >> truncate<u64>(k * 8)))!;
+    }
+    out.push(1)!;
+    out.push(1)!;
+    // nvarchar(max): "ab" in two chunks, after an unknown total.
+    out.pushLE(0xFFFFFFFFFFFFFFFEu64)!;
+    out.pushLE(2u32)!;
+    out.extend([0x61u8, 0x00][..])!;
+    out.pushLE(2u32)!;
+    out.extend([0x62u8, 0x00][..])!;
+    out.pushLE(0u32)!;
+}
+
+@test
+fn rowsDecode() -> Result<void, TestFailure> {
+    let metadata = sampleMetadata();
+    var meta = MsMeta.create();
+    let end = readColumnMetadata(metadata.view(), 0, mut meta).ok()!!;
+    Check.equalU64(metadata.length as u64, end as u64)?;
+    var row = Vector<u8>.create();
+    sampleRow(mut row);
+    // An NBCROW: everything but the id NULL (bits 1 to 5 of the bitmap).
+    var nbc = Vector<u8>.create();
+    nbc.push(0x3E)!;
+    nbc.push(4)!;
+    nbc.pushLE(7i32)!;
+    var rows = MsSqlRows.create();
+    rows.describe(meta)!;
+    var need: usize = 0;
+    let rowEnd = rows.readRow(row.view(), 0, meta, false, mut need).ok()!!;
+    Check.equalU64(row.length as u64, rowEnd as u64)?;
+    rows.readRow(nbc.view(), 0, meta, true, mut need).ok()!!;
+    Check.equalU64(2, rows.rowCount() as u64)?;
+    Check.equalText("price", rows.columnName(2))?;
+    Check.isTrue(rows.columnType(1) is MsSqlType.NVarChar, "nvarchar")?;
+    Check.equalU64(2, rows.columnIndex("PRICE")! as u64)?;
+    Check.equalI64(42, rows.int64(0, 0)!)?;
+    Check.equalText("Zoë", rows.text(0, 1)!)?;
+    Check.equalText("123.45", decimalText(rows.decimal(0, 2)!).view())?;
+    Check.equalText("2024-05-01T10:30:00", dateText(rows.dateTime(0, 3)!).view())?;
+    Check.isTrue(rows.bool(0, 4)!, "bit")?;
+    Check.equalText("ab", rows.text(0, 5)!)?;
+    Check.equalI64(7, rows.int64(1, 0)!)?;
+    Check.isTrue(rows.isNull(1, 1) && rows.isNull(1, 5), "nulls")?;
+    Check.isTrue(rows.text(1, 1) == null, "null text")?;
+    var json = String.create();
+    rows.writeJson(mut json)!;
+    Check.equalText(
+        "[{\"id\":42,\"name\":\"Zoë\",\"price\":123.45,\"at\":\"2024-05-01T10:30:00\",\"ok\":true,\"big\":\"ab\"},{\"id\":7,\"name\":null,\"price\":null,\"at\":null,\"ok\":null,\"big\":null}]",
+        json.view(),
+    )?;
+    return Ok();
+}
+
+@test
+fn partialRowsWaitForMore() -> Result<void, TestFailure> {
+    let metadata = sampleMetadata();
+    var meta = MsMeta.create();
+    readColumnMetadata(metadata.view(), 0, mut meta).ok()!!;
+    // Every prefix of the metadata is incomplete.
+    for (cut in 0..metadata.length) {
+        var partial = MsMeta.create();
+        Check.isTrue(readColumnMetadata(metadata.view()[0..cut], 0, mut partial).ok()! == null, "metadata prefix")?;
+    }
+    var row = Vector<u8>.create();
+    sampleRow(mut row);
+    var rows = MsSqlRows.create();
+    for (cut in 0..row.length) {
+        var need: usize = 0;
+        Check.isTrue(rows.readRow(row.view()[0..cut], 0, meta, false, mut need).ok()! == null, "row prefix")?;
+        Check.equalU64(0, rows.rowCount() as u64)?;
+        if (need > 0) {
+            Check.isTrue(need > cut, "need beyond what is there")?;
+            Check.isTrue(need <= row.length, "need within the row")?;
+        }
+    }
+    var need: usize = 0;
+    rows.readRow(row.view(), 0, meta, false, mut need).ok()!!;
+    Check.equalU64(1, rows.rowCount() as u64)?;
+    return Ok();
+}
+
+@test
+fn variantsDecode() -> Result<void, TestFailure> {
+    var m = Vector<u8>.create();
+    m.pushLE(1u16)!;
+    columnHeader(mut m, 0x62);
+    m.pushLE(8016u32)!;
+    columnName(mut m, "v");
+    var meta = MsMeta.create();
+    readColumnMetadata(m.view(), 0, mut meta).ok()!!;
+    // An int (0x38, no properties), then nvarchar "hi" (0xE7, max length and collation).
+    var row = Vector<u8>.create();
+    row.pushLE(6u32)!;
+    row.extend([0x38u8, 0][..])!;
+    row.pushLE(-5i32)!;
+    row.pushLE(13u32)!;
+    row.extend([0xE7u8, 7, 0x40, 0x1F, 0x09, 0x04, 0xD0, 0x00, 0x34][..])!;
+    utf16("hi", mut row);
+    var rows = MsSqlRows.create();
+    rows.describe(meta)!;
+    var need: usize = 0;
+    let first = rows.readRow(row.view(), 0, meta, false, mut need).ok()!!;
+    rows.readRow(row.view(), first, meta, false, mut need).ok()!!;
+    Check.equalI64(-5, rows.int64(0, 0)!)?;
+    Check.equalText("hi", rows.text(1, 0)!)?;
+    return Ok();
+}
+
+// ── Requests ─────────────────────────────────────────────────────────────────────────────────────────────────
+
+@test
+fn parametersAreDeclared() -> Result<void, TestFailure> {
+    var params = MsSqlParams.create();
+    params.int64(1)!;
+    params.text("x")!;
+    params.name("@total");
+    params.output();
+    params.nullOf(MsSqlType.Int)!;
+    params.decimal(MsDecimal.parse("1.25")!)!;
+    var long = String.create();
+    for (i in 0..4001) {
+        long.append("y")!;
+    }
+    params.text(long.view())!;
+    params.dateTimeOffset(MsDateTime.of(2024, 1, 1, 0, 0, 0, 0).withOffset(60))!;
+    var out = Vector<u8>.create();
+    appendDeclarations(params, mut out)!;
+    Check.equalText(
+        "@p1 bigint,@p2 nvarchar(4000),@total int output,@p4 decimal(38,2),@p5 nvarchar(max),@p6 datetimeoffset(7)",
+        StringView.fromUtf8(out.view())!,
+    )?;
+    params.name("bad name");
+    Check.isTrue(params.int32(1).isErr(), "a name with a space")?;
+    params.name("ok_name");
+    params.int32(1)!;
+    return Ok();
+}
+
+@test
+fn executeSqlIsEncoded() -> Result<void, TestFailure> {
+    var params = MsSqlParams.create();
+    params.int32(7)!;
+    let session = SessionText { collation: [0x09u8, 0x04, 0xD0, 0x00, 0x34], codePage: 1252 };
+    var out = Vector<u8>.create();
+    putExecuteSql(mut out, "SELECT @p1", params, 0, session)!;
+    let b = out.view();
+    Check.equalU64(22, b.readLE<u32>(0) as u64)?; // ALL_HEADERS
+    Check.equalU64(0xFFFF, b.readLE<u16>(22) as u64)?;
+    Check.equalU64(10, b.readLE<u16>(24) as u64)?; // sp_executesql
+    // The last parameter: its name (a count, then "@p1"), input, INTN of 4, 7.
+    let tail = b[b.length - 15..];
+    Check.equalU64(3, tail[0] as u64)?;
+    Check.equalU64(0, tail[7] as u64)?;
+    Check.equalU64(0x26, tail[8] as u64)?;
+    Check.equalI64(7, tail.readLE<i32>(11) as i64)?;
+    // A varchar that 1252 cannot hold fails before anything is sent.
+    params.clear();
+    params.varchar("世界")!;
+    Check.isTrue(putExecuteSql(mut out, "SELECT @p1", params, 0, session).isErr(), "unencodable varchar")?;
+    return Ok();
+}

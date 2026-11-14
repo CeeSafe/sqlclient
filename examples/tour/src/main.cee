@@ -1,0 +1,288 @@
+// A tour of sqlclient: each function is one of README.md's examples, run in order against a real server.
+// Usage: MSSQL_CONNECTION="Server=db,1433;Database=test;User Id=…;Password=…;TrustServerCertificate=true" out/tour
+// It works in temporary tables (#…) only, so it leaves nothing behind.
+import sqlclient.MsDateTime;
+import sqlclient.MsDecimal;
+import sqlclient.MsGuid;
+import sqlclient.MsIsolation;
+import sqlclient.MsSqlConfig;
+import sqlclient.MsSqlConnection;
+import sqlclient.MsSqlError;
+import sqlclient.MsSqlErrors;
+import sqlclient.MsSqlParams;
+import sqlclient.MsSqlPool;
+import sqlclient.MsSqlRows;
+import sqlclient.MsSqlType;
+
+async fn say(text: StringView) {
+    match (await AsyncConsole.write(text)) {
+        Ok() => {}
+        Err(_) => {}
+    }
+}
+
+async fn sayLine(label: StringView, value: StringView) {
+    var line = String.create();
+    let _ = line.append(label);
+    let _ = line.append(value);
+    let _ = line.append("\n");
+    await say(line.view());
+}
+
+async fn sayNumber(label: StringView, value: i64) {
+    var line = String.create();
+    let _ = line.append(label);
+    let _ = line.appendNumber(value);
+    let _ = line.append("\n");
+    await say(line.view());
+}
+
+/// Parameters of several types, and the typed getters that read them back.
+async fn typedValues(db: borrow mut MsSqlConnection) -> Result<void, MsSqlError> {
+    await db.batch("""
+        CREATE TABLE #orders (
+            id int IDENTITY PRIMARY KEY, customer nvarchar(100) NOT NULL, total decimal(12,2) NOT NULL,
+            placed datetime2(7) NOT NULL, ref uniqueidentifier NOT NULL, note nvarchar(200) NULL)
+        """)?;
+
+    var p = MsSqlParams.create();
+    p.text("Zoë Ångström")?;                               // @p1 nvarchar
+    p.decimal(MsDecimal.parse("1234.50")!)?;               // @p2 decimal(38, 2), exact
+    p.dateTime(MsDateTime.of(2026, 11, 15, 9, 30, 0, 0))?; // @p3 datetime2(7)
+    p.guid(MsGuid.parse("6f9619ff-8b86-d011-b42d-00c04fc964ff")!)?;
+    p.nullOf(MsSqlType.NVarChar)?; // @p5 a typed NULL
+    let added = await db.execute(
+        "INSERT #orders (customer, total, placed, ref, note) VALUES (@p1, @p2, @p3, @p4, @p5)",
+        p,
+    )?;
+    await sayNumber("rows inserted: ", truncate<i64>(added));
+
+    let none = MsSqlParams.create();
+    let rows = await db.query("SELECT id, customer, total, placed, ref, note FROM #orders", none)?;
+    for (r in 0..rows.rowCount()) {
+        let id = rows.int64(r, 0) ?? 0;
+        let customer = rows.text(r, 1) ?? ""; // UTF-8, whatever the column's collation
+        let total = rows.decimal(r, 2)!;
+        let placed = rows.dateTime(r, 3)!;
+        var line = String.create();
+        let _ = line.appendNumber(id);
+        let _ = line.append(" ");
+        let _ = line.append(customer);
+        let _ = line.append(" ");
+        let _ = total.writeText(mut line);
+        let _ = line.append(" ");
+        let _ = placed.writeText(mut line);
+        let _ = line.append(if (rows.isNull(r, 5)) " (no note)\n" else "\n");
+        await say(line.view());
+    }
+    return Ok();
+}
+
+/// Named parameters, and a column found by its name.
+async fn namedParameters(db: borrow mut MsSqlConnection) -> Result<void, MsSqlError> {
+    var p = MsSqlParams.create();
+    p.name("@who");
+    p.text("Zoë Ångström")?;
+    p.name("@least");
+    p.int32(100)?;
+    let rows = await db.query("SELECT COUNT(*) AS n FROM #orders WHERE customer = @who AND total >= @least", p)?;
+    let n = rows.columnIndex("n")!;
+    await sayNumber("matching orders: ", rows.int64(0, n) ?? 0);
+    return Ok();
+}
+
+/// A result too big to hold: rows in batches of 1,000, and a stop part-way through.
+async fn streaming(db: borrow mut MsSqlConnection) -> Result<void, MsSqlError> {
+    let none = MsSqlParams.create();
+    var batch = MsSqlRows.create();
+    var total: i64 = 0;
+    await db.start(
+        "SELECT TOP (50000) ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) FROM sys.all_objects a, sys.all_objects b",
+        none,
+    )?;
+    while (await db.fetch(mut batch, 1000)?) {
+        for (r in 0..batch.rowCount()) {
+            total += batch.int64(r, 0) ?? 0;
+        }
+    }
+    await db.finish()?;
+    await sayNumber("sum of 1..50000: ", total);
+
+    // Stopping early: cancel() sends an attention, and the connection stays usable.
+    await db.start("SELECT * FROM sys.all_objects a, sys.all_objects b", none)?;
+    let _ = await db.fetch(mut batch, 10)?;
+    await db.cancel()?;
+    await sayNumber("first rows read, then cancelled: ", truncate<i64>(batch.rowCount()));
+    return Ok();
+}
+
+/// A transaction, and a server error that leaves the connection usable.
+async fn transactions(db: borrow mut MsSqlConnection) -> Result<void, MsSqlError> {
+    await db.batch("CREATE TABLE #accounts (id int PRIMARY KEY, balance int NOT NULL)")?;
+    await db.beginWith(MsIsolation.Serializable)?;
+    var p = MsSqlParams.create();
+    p.int32(1)?;
+    p.int32(100)?;
+    await db.execute("INSERT #accounts VALUES (@p1, @p2)", p)?;
+    // The same key again: the server refuses it.
+    match (await db.execute("INSERT #accounts VALUES (@p1, @p2)", p)) {
+        Ok(_) => {}
+        Err(MsSqlError.Server) => {
+            let e = db.lastError()!;
+            await sayNumber("server error ", e.number as i64); // 2627: a primary key violation
+            await sayLine("  ", e.message.view());
+        }
+        Err(e) => { return Err(e); }
+    }
+    if (db.inTransaction()) {
+        await db.rollback()?;
+    }
+    let none = MsSqlParams.create();
+    let left = await db.query("SELECT COUNT(*) FROM #accounts", none)?;
+    await sayNumber("rows after the rollback: ", left.int64(0, 0) ?? -1);
+    return Ok();
+}
+
+/// A stored procedure with output parameters and a RETURN value; PRINT messages.
+async fn procedures(db: borrow mut MsSqlConnection) -> Result<void, MsSqlError> {
+    await db.batch("""
+        CREATE PROCEDURE #split @total int, @parts int, @each int OUTPUT, @rest int OUTPUT AS
+        BEGIN
+            PRINT 'splitting';
+            SET @each = @total / @parts;
+            SET @rest = @total % @parts;
+            RETURN @parts;
+        END
+        """)?;
+    var p = MsSqlParams.create();
+    p.name("@total");
+    p.int32(100)?;
+    p.name("@parts");
+    p.int32(7)?;
+    p.name("@each");
+    p.output();
+    p.nullOf(MsSqlType.Int)?;
+    p.name("@rest");
+    p.output();
+    p.nullOf(MsSqlType.Int)?;
+    let called = await db.callProcedure("#split", p)?;
+    let out = called.outputs(); // one row, a column per output parameter
+    await sayNumber("each: ", out.int64(0, out.columnIndex("each")!) ?? 0);
+    await sayNumber("rest: ", out.int64(0, out.columnIndex("rest")!) ?? 0);
+    await sayNumber("returned: ", (called.returnStatus() ?? 0) as i64);
+    for (m in db.messages()) {
+        await sayLine("message: ", m.message.view());
+    }
+    return Ok();
+}
+
+/// Several result sets from one batch, and a result written out as Markdown and as JSON.
+async fn resultSets(db: borrow mut MsSqlConnection) -> Result<void, MsSqlError> {
+    let none = MsSqlParams.create();
+    let all = await db.queryAll("SELECT 1 AS a, N'one' AS b; SELECT 2 AS a, N'two' AS b, SYSDATETIME() AS c;", none)?;
+    await sayNumber("result sets: ", truncate<i64>(all.count()));
+    var markdown = String.create();
+    all.result(0).writeMarkdown(mut markdown)?;
+    await say(markdown.view());
+
+    var json = String.create();
+    let rows = await db.query("SELECT customer, total FROM #orders", none)?;
+    rows.writeJson(mut json)?;
+    await sayLine("as JSON: ", json.view());
+
+    // FOR JSON: the server builds the JSON, in pieces that queryJson joins.
+    var built = String.create();
+    await db.queryJson("SELECT customer, total FROM #orders FOR JSON PATH", none, mut built)?;
+    await sayLine("FOR JSON: ", built.view());
+    return Ok();
+}
+
+/// A statement over the command timeout: the server stops it, and the connection stays usable.
+async fn timeouts(db: borrow mut MsSqlConnection) -> Result<void, MsSqlError> {
+    db.setCommandTimeout(1000);
+    match (await db.batch("WAITFOR DELAY '00:00:05'")) {
+        Err(MsSqlError.TimedOut) => { await say("timed out after 1 s\n"); }
+        Err(e) => { return Err(e); }
+        Ok(_) => { await say("finished?\n"); }
+    }
+    db.setCommandTimeout(30000);
+    let none = MsSqlParams.create();
+    let rows = await db.query("SELECT 'still usable'", none)?;
+    await sayLine("", rows.text(0, 0) ?? "");
+    return Ok();
+}
+
+/// A pool shared by eight tasks at once.
+async fn pooled(text: StringView) -> Result<void, MsSqlError> {
+    let pool = MsSqlPool.create(MsSqlConfig.parse(text)?, 4)?;
+    await squares(pool)?;
+    await say("8 tasks shared 4 pooled connections\n");
+    return Ok();
+}
+
+async fn squares(pool: borrow MsSqlPool) -> Result<void, MsSqlError> {
+    await Async.scope(MsSqlError.OutOfMemory, (s) => {
+        for (t in 0..8) {
+            s.spawn(async move () => {
+                var lease = await pool.acquire()?; // waits while all four are in use
+                var p = MsSqlParams.create();
+                p.int32(t)?;
+                let rows = await lease.connection().query("SELECT @p1 * @p1", p)?;
+                if (rows.int64(0, 0) != Some((t * t) as i64)) {
+                    return Err(MsSqlError.Protocol);
+                }
+                return Ok();
+            }); // the lease goes back to the pool here
+        }
+    })?;
+    return Ok();
+}
+
+async fn run(text: StringView) -> Result<void, MsSqlError> {
+    let config = MsSqlConfig.parse(text)?;
+    var db = await MsSqlConnection.connect(config)?;
+    let version = db.serverVersion();
+    var line = String.create();
+    let _ = line.append("connected to SQL Server ");
+    let _ = line.appendNumber(version.major);
+    let _ = line.append(if (db.isEncrypted()) ", encrypted\n" else ", login encrypted only\n");
+    await say(line.view());
+
+    await say("\n-- typed values\n");
+    await typedValues(mut db)?;
+    await say("\n-- named parameters\n");
+    await namedParameters(mut db)?;
+    await say("\n-- streaming\n");
+    await streaming(mut db)?;
+    await say("\n-- transactions and errors\n");
+    await transactions(mut db)?;
+    await say("\n-- procedures\n");
+    await procedures(mut db)?;
+    await say("\n-- result sets\n");
+    await resultSets(mut db)?;
+    await say("\n-- timeouts\n");
+    await timeouts(mut db)?;
+    await db.close()?;
+    await say("\n-- pool\n");
+    await pooled(text)?;
+    return Ok();
+}
+
+fn main() {
+    let text = match (Environment.variable("MSSQL_CONNECTION")) {
+        Some(t) => t,
+        null => {
+            Console.writeErrorLine("set MSSQL_CONNECTION to an ADO.NET connection string");
+            Process.exit(2);
+        }
+    };
+    match (Async.run(run(text))) {
+        Ok() => {}
+        Err(e) => {
+            var why = String.create();
+            let _ = MsSqlErrors.explain(e, mut why);
+            Console.writeErrorLine(why.view());
+            Process.exit(1);
+        }
+    }
+}

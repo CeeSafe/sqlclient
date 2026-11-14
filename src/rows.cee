@@ -1,0 +1,1232 @@
+// Result sets: COLMETADATA (MS-TDS 2.2.7.4) describes the columns, ROW and NBCROW (2.2.7.19, 2.2.7.15) carry the
+// values. Values are kept in one buffer per result, in a normalized form: text as UTF-8 (whatever its collation),
+// PLP chunks joined, everything else as the server sent it. Getters decode a cell where they are called.
+
+// How a cell's bytes are to be read (`MsCell.typ`).
+const T_NULL: u8 = 0;
+/// A signed little-endian integer of 2, 4 or 8 bytes, or an unsigned byte (tinyint).
+const T_INT: u8 = 1;
+const T_BIT: u8 = 2;
+/// An IEEE float of 4 or 8 bytes.
+const T_FLOAT: u8 = 3;
+/// A sign byte (1 positive) then the magnitude, little-endian, of 4, 8, 12 or 16 bytes.
+const T_DECIMAL: u8 = 4;
+/// Ten-thousandths: smallmoney as an i32; money as the high i32 then the low u32.
+const T_MONEY: u8 = 5;
+/// smalldatetime (4 bytes: days and minutes since 1900) or datetime (8: days and 1/300 seconds since 1900).
+const T_DATETIME: u8 = 6;
+const T_DATE: u8 = 7;
+const T_TIME: u8 = 8;
+const T_DATETIME2: u8 = 9;
+const T_DATETIMEOFFSET: u8 = 10;
+const T_GUID: u8 = 11;
+/// UTF-8 text.
+const T_TEXT: u8 = 12;
+const T_BINARY: u8 = 13;
+
+// How a column's values are framed on the wire (`MsColumn.layout`).
+const L_FIXED: u8 = 0;
+/// A one-byte length; 0 is NULL.
+const L_BYTE: u8 = 1;
+/// A two-byte length; 0xFFFF is NULL.
+const L_USHORT: u8 = 2;
+/// Partially length-prefixed: an eight-byte total (all ones: NULL), then chunks with four-byte lengths, ended by an
+/// empty one.
+const L_PLP: u8 = 3;
+/// text, ntext and image: a text pointer's length (0: NULL), the pointer, a timestamp, a four-byte length.
+const L_TEXTPTR: u8 = 4;
+/// sql_variant: a four-byte length; 0 is NULL.
+const L_LONG: u8 = 5;
+
+/// What text in a column is: not text, UTF-16, or a code page's bytes.
+const ENC_NONE: u8 = 0;
+const ENC_UTF16: u8 = 1;
+const ENC_CODE_PAGE: u8 = 2;
+
+/// A column: its name (in its result's name buffer) and how its values are sent and kept.
+struct MsColumn {
+    nameAt: usize;
+    nameLength: usize;
+    kind: MsSqlType;
+    /// The TDS type byte.
+    wire: u8;
+    layout: u8;
+    fixedLength: usize;
+    /// The declared maximum length in bytes (for the string and binary types), 0 for (MAX).
+    maxLength: u32;
+    precision: u8;
+    scale: u8;
+    encoding: u8;
+    codePage: u16;
+    flags: u16;
+    /// `MsCell.typ` for its values (sql_variant's come with their own).
+    cellType: u8;
+}
+
+fn blankColumn() -> MsColumn => MsColumn {
+    nameAt: 0,
+    nameLength: 0,
+    kind: MsSqlType.Null,
+    wire: 0x1F,
+    layout: L_FIXED,
+    fixedLength: 0,
+    maxLength: 0,
+    precision: 0,
+    scale: 0,
+    encoding: ENC_NONE,
+    codePage: 0,
+    flags: 0,
+    cellType: T_NULL,
+};
+
+struct MsCell {
+    at: usize;
+    length: usize;
+    typ: u8;
+    scale: u8;
+}
+
+/// The column descriptions of the result being read.
+@noncopy
+struct MsMeta {
+    columns: Vector<MsColumn>;
+    names: Vector<u8>;
+
+    fn create() -> MsMeta => MsMeta { columns: Vector<MsColumn>.create(), names: Vector<u8>.create() };
+
+    fn clear(borrow mut this) {
+        this.columns.clear();
+        this.names.clear();
+    }
+}
+
+/// The result of a parse step over the bytes received so far: where the token ends, or null when it runs past
+/// them. On null, `need` holds how many bytes from the token's start are known to be needed (0 when unknown).
+fn incomplete(need: borrow mut usize, upTo: usize) -> Result<usize?, MsSqlError> {
+    if (upTo > need) {
+        need = upTo;
+    }
+    return Ok(null);
+}
+
+/// One result set: its columns and every row read into it.
+///
+/// Cells are kept in one buffer: text as UTF-8, whatever the column's collation; `(MAX)` values joined into one
+/// piece; other values as the server sent them. Reading a result allocates per result, not per row or value. Rows
+/// and columns are numbered from 0; an index out of range panics. A `MsSqlRows` passed again to `queryInto` or
+/// `fetch` is cleared and its memory reused.
+///
+/// Getters give `null` for SQL NULL and for a value of a type they do not read: `text` reads the character types
+/// and XML, `int64` the integer types, `bit`, whole decimals and integer text, and so on. `writeValue` writes any
+/// value as text.
+@noncopy
+public struct MsSqlRows {
+    private data: Vector<u8>;
+    private cells: Vector<MsCell>;
+    private columns: Vector<MsColumn>;
+    private names: Vector<u8>;
+    private rows: usize;
+    private affected: u64;
+    /// PLP text gathered before conversion.
+    private scratch: Vector<u8>;
+
+    /// No columns and no rows yet.
+    public fn create() -> MsSqlRows => MsSqlRows {
+        data: Vector<u8>.create(),
+        cells: Vector<MsCell>.create(),
+        columns: Vector<MsColumn>.create(),
+        names: Vector<u8>.create(),
+        rows: 0,
+        affected: 0,
+        scratch: Vector<u8>.create(),
+    };
+
+    /// Removes the rows and the columns, keeping the memory.
+    public fn clear(borrow mut this) {
+        this.clearRows();
+        this.columns.clear();
+        this.names.clear();
+        this.affected = 0;
+    }
+
+    fn clearRows(borrow mut this) {
+        this.data.clear();
+        this.cells.clear();
+        this.rows = 0;
+    }
+
+    /// Takes `meta`'s columns.
+    fn describe(borrow mut this, meta: borrow MsMeta) -> Result<void, MsSqlError> {
+        this.columns.clear();
+        this.names.clear();
+        allocated(this.columns.extend(meta.columns.view()))?;
+        return allocated(this.names.extend(meta.names.view()));
+    }
+
+    fn setAffected(borrow mut this, count: u64) {
+        this.affected = count;
+    }
+
+    // ---- Shape ----
+
+    /// The number of rows.
+    public fn rowCount(borrow this) -> usize => this.rows;
+
+    /// The number of columns.
+    public fn columnCount(borrow this) -> usize => this.columns.length;
+
+    /// The row count the server reported for the statement that produced this result.
+    public fn affectedRows(borrow this) -> u64 => this.affected;
+
+    /// Column `c`'s name (empty for an expression without an alias).
+    public fn columnName(borrow this, c: usize) -> StringView {
+        let column = this.columns[c];
+        // Names are UTF-8 made by Utf16.decodeBytes.
+        return StringView.fromUtf8(this.names[column.nameAt..column.nameAt + column.nameLength])!;
+    }
+
+    /// Column `c`'s type.
+    public fn columnType(borrow this, c: usize) -> MsSqlType => this.columns[c].kind;
+
+    /// Column `c`'s declared length in bytes for the character and binary types (`nvarchar(50)` is 100), 0 for
+    /// `(MAX)` and for other types.
+    public fn columnLength(borrow this, c: usize) -> u32 => this.columns[c].maxLength;
+
+    /// Column `c`'s precision (decimal and numeric).
+    public fn columnPrecision(borrow this, c: usize) -> u8 => this.columns[c].precision;
+
+    /// Column `c`'s scale (decimal, numeric, time, datetime2, datetimeoffset).
+    public fn columnScale(borrow this, c: usize) -> u8 => this.columns[c].scale;
+
+    /// Whether column `c` may hold NULL.
+    public fn columnNullable(borrow this, c: usize) -> bool => (this.columns[c].flags & 0x01) != 0;
+
+    /// The index of the first column named `name`, compared without regard to ASCII case as SQL Server's default
+    /// collations compare names; null if none is.
+    public fn columnIndex(borrow this, name: StringView) -> usize? {
+        for (c in 0..this.columns.length) {
+            if (this.columnName(c).equalsIgnoreAsciiCase(name)) {
+                return c;
+            }
+        }
+        return null;
+    }
+
+    fn cell(borrow this, row: usize, c: usize) -> MsCell {
+        if (row >= this.rows || c >= this.columns.length) {
+            return this.cells[this.cells.length]; // out of range: panics with the index
+        }
+        return this.cells[row * this.columns.length + c];
+    }
+
+    fn bytesOf(borrow this, cell: MsCell) -> Slice<u8> => this.data[cell.at..cell.at + cell.length];
+
+    // ---- Getters ----
+
+    /// Whether the value at `row`, column `c` is SQL NULL.
+    public fn isNull(borrow this, row: usize, c: usize) -> bool => this.cell(row, c).typ == T_NULL;
+
+    /// The text of a character or XML value (as UTF-8), or null.
+    public fn text(borrow this, row: usize, c: usize) -> StringView? {
+        let cell = this.cell(row, c);
+        if (cell.typ != T_TEXT) {
+            return null;
+        }
+        return StringView.fromUtf8(this.bytesOf(cell));
+    }
+
+    /// The bytes of a binary value (`binary`, `varbinary`, `image`, `timestamp`, a CLR type), or the UTF-8 bytes
+    /// of text; null otherwise.
+    public fn bytes(borrow this, row: usize, c: usize) -> Slice<u8>? {
+        let cell = this.cell(row, c);
+        if (cell.typ != T_BINARY && cell.typ != T_TEXT) {
+            return null;
+        }
+        return this.bytesOf(cell);
+    }
+
+    /// An integer value (`tinyint` to `bigint`, `bit`), a whole decimal or money value in range, or text that is
+    /// an integer; null otherwise.
+    public fn int64(borrow this, row: usize, c: usize) -> i64? {
+        let cell = this.cell(row, c);
+        let b = this.bytesOf(cell);
+        if (cell.typ == T_INT) {
+            return match (cell.length) {
+                1 => b[0] as i64,
+                2 => b.readLE<i16>(0) as i64,
+                4 => b.readLE<i32>(0) as i64,
+                8 => b.readLE<i64>(0),
+                _ => null,
+            };
+        }
+        if (cell.typ == T_BIT) {
+            return if (b[0] != 0) 1i64 else 0i64;
+        }
+        if (cell.typ == T_DECIMAL || cell.typ == T_MONEY) {
+            return this.decimal(row, c)?.toInt64();
+        }
+        if (cell.typ == T_TEXT) {
+            return b.trim().parseInt<i64>();
+        }
+        return null;
+    }
+
+    /// As `int64`, when the value fits an `i32`.
+    public fn int32(borrow this, row: usize, c: usize) -> i32? => checkedTruncate<i32>(this.int64(row, c)?);
+
+    /// A `bit` value, or an integer (non-zero is true); null otherwise.
+    public fn bool(borrow this, row: usize, c: usize) -> bool? {
+        let cell = this.cell(row, c);
+        if (cell.typ == T_BIT) {
+            return this.data[cell.at] != 0;
+        }
+        if (cell.typ == T_INT) {
+            return this.int64(row, c)? != 0;
+        }
+        return null;
+    }
+
+    /// A `float` or `real` value, or any other number (integers, decimals, money) or numeric text as the nearest
+    /// `f64`; null otherwise.
+    public fn float64(borrow this, row: usize, c: usize) -> f64? {
+        let cell = this.cell(row, c);
+        let b = this.bytesOf(cell);
+        if (cell.typ == T_FLOAT) {
+            if (cell.length == 4) {
+                return round<f64>(f32.fromBits(b.readLE<u32>(0)));
+            }
+            return f64.fromBits(b.readLE<u64>(0));
+        }
+        if (cell.typ == T_INT || cell.typ == T_BIT) {
+            return round<f64>(this.int64(row, c)?);
+        }
+        if (cell.typ == T_DECIMAL || cell.typ == T_MONEY) {
+            return this.decimal(row, c)?.toFloat64();
+        }
+        if (cell.typ == T_TEXT) {
+            return b.trim().parseFloat<f64>();
+        }
+        return null;
+    }
+
+    /// A `decimal`, `numeric`, `money` or `smallmoney` value exactly, an integer as a decimal of scale 0, or
+    /// decimal text; null otherwise.
+    public fn decimal(borrow this, row: usize, c: usize) -> MsDecimal? {
+        let cell = this.cell(row, c);
+        let b = this.bytesOf(cell);
+        if (cell.typ == T_DECIMAL) {
+            var d = MsDecimal { negative: b[0] == 0, limbs: [0u32; 4], scale: cell.scale };
+            var k: usize = 0;
+            while (k < 4 && 1 + k * 4 + 4 <= b.length) {
+                d.limbs[k] = b.readLE<u32>(1 + k * 4);
+                k += 1;
+            }
+            return d;
+        }
+        if (cell.typ == T_MONEY) {
+            // money: the high 32 bits first, then the low.
+            let units = if (cell.length == 4) b.readLE<i32>(0) as i64
+                else truncate<i64>(((b.readLE<u32>(0) as u64) << 32) | (b.readLE<u32>(4) as u64));
+            return MsDecimal.ofInt(units, 4);
+        }
+        if (cell.typ == T_INT || cell.typ == T_BIT) {
+            return MsDecimal.ofInt(this.int64(row, c)?, 0);
+        }
+        if (cell.typ == T_TEXT) {
+            return MsDecimal.parse(StringView.fromUtf8(b)?);
+        }
+        return null;
+    }
+
+    /// A `uniqueidentifier` value, or text in its form; null otherwise.
+    public fn guid(borrow this, row: usize, c: usize) -> MsGuid? {
+        let cell = this.cell(row, c);
+        let b = this.bytesOf(cell);
+        if (cell.typ == T_GUID && b.length == 16) {
+            var g = MsGuid { bytes: [0u8; 16] };
+            g.bytes[..].copyFrom(b);
+            return g;
+        }
+        if (cell.typ == T_TEXT) {
+            return MsGuid.parse(StringView.fromUtf8(b)?);
+        }
+        return null;
+    }
+
+    /// A `date`, `time`, `datetime`, `smalldatetime`, `datetime2` or `datetimeoffset` value; null otherwise.
+    public fn dateTime(borrow this, row: usize, c: usize) -> MsDateTime? {
+        let cell = this.cell(row, c);
+        let b = this.bytesOf(cell);
+        let n = cell.length;
+        if (cell.typ == T_DATETIME) {
+            if (n == 4) {
+                let days = b.readLE<u16>(0) as i64;
+                let minutes = b.readLE<u16>(2) as u64;
+                return atDay(days + DAYS_0001_TO_1900, minutes * 60 * 10000000);
+            }
+            let days = b.readLE<i32>(0) as i64;
+            let ticks300 = b.readLE<u32>(4) as u64;
+            // 1/300 s to 100 ns, rounded as SQL Server shows it (.003, .007).
+            let units = (ticks300 * 100000 + 1) / 3;
+            let ms = (units + 5000) / 10000;
+            return atDay(days + DAYS_0001_TO_1900, ms * 10000);
+        }
+        if (cell.typ == T_DATE && n == 3) {
+            return civilFromDays(truncate<i64>(readUnsigned(b, 0, 3)));
+        }
+        if (cell.typ == T_TIME && n >= 3) {
+            var t = atDay(0, timeUnits(readUnsigned(b, 0, n), cell.scale))?;
+            t.hasDate = false;
+            return t;
+        }
+        if (cell.typ == T_DATETIME2 && n >= 6) {
+            return atDay(truncate<i64>(readUnsigned(b, n - 3, 3)), timeUnits(readUnsigned(b, 0, n - 3), cell.scale));
+        }
+        if (cell.typ == T_DATETIMEOFFSET && n >= 8) {
+            let offset = b.readLE<i16>(n - 2);
+            let days = truncate<i64>(readUnsigned(b, n - 5, 3));
+            let utc = timeUnits(readUnsigned(b, 0, n - 5), cell.scale);
+            // The wire holds UTC; give the local time at the offset.
+            let perDay: i64 = 864000000000;
+            var local = truncate<i64>(utc) + (offset as i64) * 600000000;
+            var day = days;
+            if (local < 0) {
+                local += perDay;
+                day -= 1;
+            } else if (local >= perDay) {
+                local -= perDay;
+                day += 1;
+            }
+            var d = atDay(day, truncate<u64>(local))?;
+            d.offsetMinutes = offset;
+            d.hasOffset = true;
+            return d;
+        }
+        return null;
+    }
+
+    /// Appends any value as text to `out`: numbers in decimal, `bit` as `1`/`0`, dates in ISO 8601, GUIDs in
+    /// their canonical form, binary as `0x…` hex, text as it is. False (and nothing appended) for SQL NULL.
+    public fn writeValue(borrow this, row: usize, c: usize, out: borrow mut String) -> Result<bool, MsSqlError> {
+        var bytes = Vector<u8>.create();
+        if (!this.appendValue(row, c, mut bytes)?) {
+            return Ok(false);
+        }
+        // appendValue writes UTF-8.
+        allocated(appendBytes(out, bytes.view()))?;
+        return Ok(true);
+    }
+
+    /// The value as `writeValue` writes it, appended to bytes.
+    fn appendValue(borrow this, row: usize, c: usize, out: borrow mut Vector<u8>) -> Result<bool, MsSqlError> {
+        let cell = this.cell(row, c);
+        let b = this.bytesOf(cell);
+        let t = cell.typ;
+        if (t == T_NULL) {
+            return Ok(false);
+        }
+        if (t == T_TEXT) {
+            allocated(out.extend(b))?;
+        } else if (t == T_INT || t == T_BIT) {
+            allocated(pad(out, this.int64(row, c)!, 1))?;
+        } else if (t == T_FLOAT) {
+            var s = String.create();
+            allocated(s.appendNumber(this.float64(row, c)!))?;
+            allocated(out.extend(s.view().bytes()))?;
+        } else if (t == T_DECIMAL || t == T_MONEY) {
+            allocated(this.decimal(row, c)!.write(out))?;
+        } else if (t == T_GUID) {
+            allocated(this.guid(row, c)!.write(out))?;
+        } else if (t == T_BINARY) {
+            let hex = "0123456789ABCDEF".bytes();
+            allocated(out.extend("0x".bytes()))?;
+            for (x in b) {
+                allocated(out.push(hex[(x >> 4) as usize]))?;
+                allocated(out.push(hex[(x & 0x0F) as usize]))?;
+            }
+        } else {
+            match (this.dateTime(row, c)) {
+                Some(d) => { allocated(d.write(out))?; }
+                null => { return Err(MsSqlError.Protocol); }
+            }
+        }
+        return Ok(true);
+    }
+
+    /// Appends the rows as a JSON array of objects, one member per column, in column order: numbers as numbers,
+    /// `bit` as `true`/`false`, NULL as `null`, binary as base64 strings, everything else as strings. A column
+    /// without a name is `""`.
+    public fn writeJson(borrow this, out: borrow mut String) -> Result<void, MsSqlError> {
+        var json = Vector<u8>.create();
+        allocated(json.push('['))?;
+        var value = Vector<u8>.create();
+        for (r in 0..this.rows) {
+            if (r > 0) {
+                allocated(json.push(','))?;
+            }
+            allocated(json.push('{'))?;
+            for (c in 0..this.columns.length) {
+                if (c > 0) {
+                    allocated(json.push(','))?;
+                }
+                let column = this.columns[c];
+                allocated(jsonString(this.names[column.nameAt..column.nameAt + column.nameLength], mut json))?;
+                allocated(json.push(':'))?;
+                let cell = this.cell(r, c);
+                let t = cell.typ;
+                if (t == T_NULL) {
+                    allocated(json.extend("null".bytes()))?;
+                } else if (t == T_BIT) {
+                    allocated(json.extend(if (this.data[cell.at] != 0) "true".bytes() else "false".bytes()))?;
+                } else if (t == T_INT || t == T_DECIMAL || t == T_MONEY) {
+                    this.appendValue(r, c, mut json)?;
+                } else if (t == T_FLOAT) {
+                    let f = this.float64(r, c)!;
+                    if (f != f || f == f * 2.0 && f != 0.0) {
+                        allocated(json.extend("null".bytes()))?; // NaN and the infinities have no JSON form
+                    } else {
+                        this.appendValue(r, c, mut json)?;
+                    }
+                } else if (t == T_BINARY) {
+                    allocated(json.push('"'))?;
+                    allocated(base64(this.bytesOf(cell), mut json))?;
+                    allocated(json.push('"'))?;
+                } else {
+                    value.clear();
+                    this.appendValue(r, c, mut value)?;
+                    allocated(jsonString(value.view(), mut json))?;
+                }
+            }
+            allocated(json.push('}'))?;
+        }
+        allocated(json.push(']'))?;
+        return allocated(appendBytes(out, json.view()));
+    }
+
+    /// Appends the rows as a Markdown table: a header row of column names, then one row per row (NULL as `NULL`,
+    /// `|` escaped).
+    public fn writeMarkdown(borrow this, out: borrow mut String) -> Result<void, MsSqlError> {
+        var md = Vector<u8>.create();
+        allocated(md.push('|'))?;
+        for (c in 0..this.columns.length) {
+            allocated(md.push(' '))?;
+            allocated(markdownCell(this.columnName(c).bytes(), mut md))?;
+            allocated(md.extend(" |".bytes()))?;
+        }
+        allocated(md.extend("\n|".bytes()))?;
+        for (c in 0..this.columns.length) {
+            allocated(md.extend(" --- |".bytes()))?;
+        }
+        allocated(md.push('\n'))?;
+        var value = Vector<u8>.create();
+        for (r in 0..this.rows) {
+            allocated(md.push('|'))?;
+            for (c in 0..this.columns.length) {
+                value.clear();
+                if (!this.appendValue(r, c, mut value)?) {
+                    allocated(value.extend("NULL".bytes()))?;
+                }
+                allocated(md.push(' '))?;
+                allocated(markdownCell(value.view(), mut md))?;
+                allocated(md.extend(" |".bytes()))?;
+            }
+            allocated(md.push('\n'))?;
+        }
+        return allocated(appendBytes(out, md.view()));
+    }
+
+    // ---- Decoding ----
+
+    /// Reads one ROW (or NBCROW, with its null bitmap) at `at`, with `meta`'s columns, into a new row. On null
+    /// (the row runs past `data`) nothing is kept.
+    fn readRow(
+        borrow mut this,
+        data: Slice<u8>,
+        at: usize,
+        meta: borrow MsMeta,
+        nullBitmap: bool,
+        need: borrow mut usize,
+    ) -> Result<usize?, MsSqlError> {
+        let n = meta.columns.length;
+        let start = at;
+        let keptData = this.data.length;
+        let keptCells = this.cells.length;
+        var pos = at;
+        let bitmapAt = pos;
+        if (nullBitmap) {
+            pos += (n + 7) / 8;
+            if (pos > data.length) {
+                return incomplete(need, pos - start);
+            }
+        }
+        allocated(this.cells.reserve(n))?;
+        for (i in 0..n) {
+            if (nullBitmap && (data[bitmapAt + i / 8] & (1u8 << truncate<u8>(i % 8))) != 0) {
+                allocated(this.cells.push(MsCell { at: 0, length: 0, typ: T_NULL, scale: 0 }))?;
+                continue;
+            }
+            var valueNeed: usize = 0;
+            match (this.readValue(data, pos, meta.columns[i], mut valueNeed)?) {
+                Some(p) => { pos = p; }
+                null => {
+                    this.data.truncate(keptData);
+                    this.cells.truncate(keptCells);
+                    if (valueNeed > 0) {
+                        return incomplete(need, pos - start + valueNeed);
+                    }
+                    return incomplete(need, 0);
+                }
+            }
+        }
+        this.rows += 1;
+        return Ok(Some(pos));
+    }
+
+    /// Reads one value of `column` at `at` into a new cell; null when it runs past `data` (`need` then counts
+    /// from `at`).
+    fn readValue(
+        borrow mut this,
+        data: Slice<u8>,
+        at: usize,
+        column: MsColumn,
+        need: borrow mut usize,
+    ) -> Result<usize?, MsSqlError> {
+        var pos = at;
+        var length: usize = 0;
+        let layout = column.layout;
+        if (layout == L_FIXED) {
+            length = column.fixedLength;
+        } else if (layout == L_BYTE) {
+            if (pos + 1 > data.length) {
+                return incomplete(need, 1);
+            }
+            length = data[pos] as usize;
+            pos += 1;
+            if (length == 0) {
+                return this.nullCell(pos);
+            }
+        } else if (layout == L_USHORT) {
+            if (pos + 2 > data.length) {
+                return incomplete(need, 2);
+            }
+            let l = data.readLE<u16>(pos);
+            pos += 2;
+            if (l == 0xFFFF) {
+                return this.nullCell(pos);
+            }
+            length = l as usize;
+        } else if (layout == L_LONG) {
+            if (pos + 4 > data.length) {
+                return incomplete(need, 4);
+            }
+            length = data.readLE<u32>(pos) as usize;
+            pos += 4;
+            if (length == 0) {
+                return this.nullCell(pos);
+            }
+        } else if (layout == L_TEXTPTR) {
+            if (pos + 1 > data.length) {
+                return incomplete(need, 1);
+            }
+            let pointer = data[pos] as usize;
+            pos += 1;
+            if (pointer == 0) {
+                return this.nullCell(pos);
+            }
+            pos += pointer + 8; // the text pointer and its timestamp
+            if (pos + 4 > data.length) {
+                return incomplete(need, pos + 4 - at);
+            }
+            length = data.readLE<u32>(pos) as usize;
+            pos += 4;
+        } else {
+            return this.readPlp(data, at, column, need);
+        }
+        if (pos + length > data.length) {
+            return incomplete(need, pos + length - at);
+        }
+        let value = data[pos..pos + length];
+        if (column.wire == 0x62) {
+            this.storeVariant(value)?;
+        } else {
+            this.store(value, column.cellType, column.scale, column.encoding, column.codePage)?;
+        }
+        return Ok(Some(pos + length));
+    }
+
+    fn nullCell(borrow mut this, pos: usize) -> Result<usize?, MsSqlError> {
+        allocated(this.cells.push(MsCell { at: 0, length: 0, typ: T_NULL, scale: 0 }))?;
+        return Ok(Some(pos));
+    }
+
+    /// Stores `value` as a cell of type `typ`, converting text to UTF-8.
+    fn store(
+        borrow mut this,
+        value: Slice<u8>,
+        typ: u8,
+        scale: u8,
+        encoding: u8,
+        codePage: u16,
+    ) -> Result<void, MsSqlError> {
+        let at = this.data.length;
+        if (encoding == ENC_UTF16) {
+            allocated(Utf16.decodeBytes(value, mut this.data))?;
+        } else if (encoding == ENC_CODE_PAGE) {
+            allocated(CodePages.decode(codePage, value, mut this.data))?;
+        } else {
+            allocated(this.data.extend(value))?;
+        }
+        return allocated(this.cells.push(MsCell { at: at, length: this.data.length - at, typ: typ, scale: scale }));
+    }
+
+    /// A PLP value: the chunks joined (text through the scratch buffer, to be converted whole).
+    fn readPlp(
+        borrow mut this,
+        data: Slice<u8>,
+        at: usize,
+        column: MsColumn,
+        need: borrow mut usize,
+    ) -> Result<usize?, MsSqlError> {
+        if (at + 8 > data.length) {
+            return incomplete(need, 8);
+        }
+        let total = data.readLE<u64>(at);
+        if (total == 0xFFFFFFFFFFFFFFFF) {
+            return this.nullCell(at + 8);
+        }
+        // A known total (not 0xFFFFFFFFFFFFFFFE, "unknown") tells how much is coming, so the reader can wait for
+        // all of it at once.
+        let known = total != 0xFFFFFFFFFFFFFFFE;
+        let text = column.encoding != ENC_NONE;
+        let dataAt = this.data.length;
+        this.scratch.clear();
+        var pos = at + 8;
+        loop {
+            if (pos + 4 > data.length) {
+                this.data.truncate(dataAt);
+                if (known) {
+                    let all = checkedTruncate<usize>(total) ?? 0;
+                    return incomplete(need, pos + 4 - at + all.saturatingSub(this.plpSoFar(text, dataAt)));
+                }
+                return incomplete(need, pos + 4 - at);
+            }
+            let chunk = data.readLE<u32>(pos) as usize;
+            pos += 4;
+            if (chunk == 0) {
+                break;
+            }
+            if (pos + chunk > data.length) {
+                this.data.truncate(dataAt);
+                return incomplete(need, pos + chunk - at);
+            }
+            if (text) {
+                allocated(this.scratch.extend(data[pos..pos + chunk]))?;
+            } else {
+                allocated(this.data.extend(data[pos..pos + chunk]))?;
+            }
+            pos += chunk;
+        }
+        if (text) {
+            let joined = this.scratch.view();
+            if (column.encoding == ENC_UTF16) {
+                allocated(Utf16.decodeBytes(joined, mut this.data))?;
+            } else {
+                allocated(CodePages.decode(column.codePage, joined, mut this.data))?;
+            }
+            this.scratch.clear();
+        }
+        allocated(this.cells.push(MsCell {
+            at: dataAt,
+            length: this.data.length - dataAt,
+            typ: column.cellType,
+            scale: column.scale,
+        }))?;
+        return Ok(Some(pos));
+    }
+
+    /// How many value bytes an unfinished PLP read had gathered.
+    fn plpSoFar(borrow this, text: bool, dataAt: usize) -> usize =>
+        if (text) this.scratch.length else this.data.length - dataAt;
+
+    /// A sql_variant value (MS-TDS 2.2.5.5.3): its base type, its properties, then the value.
+    fn storeVariant(borrow mut this, value: Slice<u8>) -> Result<void, MsSqlError> {
+        if (value.length < 2) {
+            return Err(MsSqlError.Protocol);
+        }
+        let base = value[0];
+        let props = value[1] as usize;
+        if (2 + props > value.length) {
+            return Err(MsSqlError.Protocol);
+        }
+        let p = value[2..2 + props];
+        let bytes = value[2 + props..];
+        var column = blankColumn();
+        column.wire = base;
+        if (!describeWire(base, mut column)) {
+            return Err(MsSqlError.Protocol);
+        }
+        if (base == 0x6A || base == 0x6C) {
+            if (p.length < 2) {
+                return Err(MsSqlError.Protocol);
+            }
+            column.scale = p[1];
+        } else if (base == 0x29 || base == 0x2A || base == 0x2B) {
+            if (p.length < 1) {
+                return Err(MsSqlError.Protocol);
+            }
+            column.scale = p[0];
+        } else if (base == 0xA7 || base == 0xAF) {
+            if (p.length < 7) {
+                return Err(MsSqlError.Protocol);
+            }
+            column.codePage = collationCodePage(p[2..7]);
+        }
+        return this.store(bytes, column.cellType, column.scale, column.encoding, column.codePage);
+    }
+
+    // ---- Output parameters ----
+
+    /// Adds a column `name` with one value, for a stored procedure's output parameters, which come one at a time.
+    /// The first makes row 0.
+    fn addOutput(
+        borrow mut this,
+        name: Slice<u8>,
+        column: MsColumn,
+        data: Slice<u8>,
+        at: usize,
+        need: borrow mut usize,
+    ) -> Result<usize?, MsSqlError> {
+        var described = column;
+        described.nameAt = this.names.length;
+        described.nameLength = name.length;
+        let keptData = this.data.length;
+        let keptCells = this.cells.length;
+        match (this.readValue(data, at, described, need)?) {
+            Some(end) => {
+                allocated(this.names.extend(name))?;
+                allocated(this.columns.push(described))?;
+                this.rows = 1;
+                return Ok(Some(end));
+            }
+            null => {
+                this.data.truncate(keptData);
+                this.cells.truncate(keptCells);
+                return Ok(null);
+            }
+        }
+    }
+}
+
+/// The date `days` after 0001-01-01 at `units` (100 ns) after midnight; null past the day.
+fn atDay(days: i64, units: u64) -> MsDateTime? {
+    if (units >= 864000000000) {
+        return null;
+    }
+    var d = civilFromDays(days);
+    let seconds = units / 10000000;
+    d.hour = truncate<u8>(seconds / 3600);
+    d.minute = truncate<u8>((seconds / 60) % 60);
+    d.second = truncate<u8>(seconds % 60);
+    d.nanos = truncate<u32>((units % 10000000) * 100);
+    d.hasTime = true;
+    return d;
+}
+
+/// A time's value at `scale` as 100-nanosecond units.
+fn timeUnits(value: u64, scale: u8) -> u64 {
+    var v = value;
+    var s = scale;
+    while (s < 7) {
+        v *= 10;
+        s += 1;
+    }
+    return v;
+}
+
+/// `count` bytes at `at` as an unsigned little-endian number.
+fn readUnsigned(b: Slice<u8>, at: usize, count: usize) -> u64 {
+    var v: u64 = 0;
+    var k = count;
+    while (k > 0) {
+        k -= 1;
+        v = (v << 8) | (b[at + k] as u64);
+    }
+    return v;
+}
+
+/// Sets `column`'s layout, cell type, kind and encoding from its TDS type byte, for the types whose TYPE_INFO is
+/// the type alone or a length; false for a type byte it does not know.
+fn describeWire(wire: u8, column: borrow mut MsColumn) -> bool {
+    column.wire = wire;
+    column.encoding = ENC_NONE;
+    column.layout = L_BYTE;
+    if (wire == 0x1F) {
+        column.kind = MsSqlType.Null;
+        column.layout = L_FIXED;
+        column.fixedLength = 0;
+        column.cellType = T_NULL;
+    } else if (wire == 0x30 || wire == 0x34 || wire == 0x38 || wire == 0x7F) {
+        column.layout = L_FIXED;
+        column.cellType = T_INT;
+        column.fixedLength =
+            if (wire == 0x30) 1usize else (if (wire == 0x34) 2usize else (if (wire == 0x38) 4usize else 8usize));
+        column.kind = intKind(column.fixedLength);
+    } else if (wire == 0x26) {
+        column.cellType = T_INT;
+        column.kind = MsSqlType.Int;
+    } else if (wire == 0x32 || wire == 0x68) {
+        column.layout = if (wire == 0x32) L_FIXED else L_BYTE;
+        column.fixedLength = 1;
+        column.cellType = T_BIT;
+        column.kind = MsSqlType.Bit;
+    } else if (wire == 0x3B || wire == 0x3E) {
+        column.layout = L_FIXED;
+        column.fixedLength = if (wire == 0x3B) 4usize else 8usize;
+        column.cellType = T_FLOAT;
+        column.kind = if (wire == 0x3B) MsSqlType.Real else MsSqlType.Float;
+    } else if (wire == 0x6D) {
+        column.cellType = T_FLOAT;
+        column.kind = MsSqlType.Float;
+    } else if (wire == 0x3C || wire == 0x7A) {
+        column.layout = L_FIXED;
+        column.fixedLength = if (wire == 0x3C) 8usize else 4usize;
+        column.cellType = T_MONEY;
+        column.kind = if (wire == 0x3C) MsSqlType.Money else MsSqlType.SmallMoney;
+    } else if (wire == 0x6E) {
+        column.cellType = T_MONEY;
+        column.kind = MsSqlType.Money;
+    } else if (wire == 0x3D || wire == 0x3A) {
+        column.layout = L_FIXED;
+        column.fixedLength = if (wire == 0x3D) 8usize else 4usize;
+        column.cellType = T_DATETIME;
+        column.kind = if (wire == 0x3D) MsSqlType.DateTime else MsSqlType.SmallDateTime;
+    } else if (wire == 0x6F) {
+        column.cellType = T_DATETIME;
+        column.kind = MsSqlType.DateTime;
+    } else if (wire == 0x6A || wire == 0x37) {
+        column.cellType = T_DECIMAL;
+        column.kind = MsSqlType.Decimal;
+    } else if (wire == 0x6C || wire == 0x3F) {
+        column.cellType = T_DECIMAL;
+        column.kind = MsSqlType.Numeric;
+    } else if (wire == 0x24) {
+        column.cellType = T_GUID;
+        column.kind = MsSqlType.UniqueIdentifier;
+    } else if (wire == 0x28) {
+        column.cellType = T_DATE;
+        column.kind = MsSqlType.Date;
+    } else if (wire == 0x29) {
+        column.cellType = T_TIME;
+        column.kind = MsSqlType.Time;
+    } else if (wire == 0x2A) {
+        column.cellType = T_DATETIME2;
+        column.kind = MsSqlType.DateTime2;
+    } else if (wire == 0x2B) {
+        column.cellType = T_DATETIMEOFFSET;
+        column.kind = MsSqlType.DateTimeOffset;
+    } else if (wire == 0xA7 || wire == 0xAF || wire == 0x23) {
+        column.layout = if (wire == 0x23) L_TEXTPTR else L_USHORT;
+        column.cellType = T_TEXT;
+        column.encoding = ENC_CODE_PAGE;
+        column.codePage = 1252;
+        column.kind = if (wire == 0xA7) MsSqlType.VarChar else (if (wire == 0xAF) MsSqlType.Char else MsSqlType.Text);
+    } else if (wire == 0xE7 || wire == 0xEF || wire == 0x63) {
+        column.layout = if (wire == 0x63) L_TEXTPTR else L_USHORT;
+        column.cellType = T_TEXT;
+        column.encoding = ENC_UTF16;
+        column.kind =
+            if (wire == 0xE7) MsSqlType.NVarChar else (if (wire == 0xEF) MsSqlType.NChar else MsSqlType.NText);
+    } else if (wire == 0xA5 || wire == 0xAD || wire == 0x22) {
+        column.layout = if (wire == 0x22) L_TEXTPTR else L_USHORT;
+        column.cellType = T_BINARY;
+        column.kind =
+            if (wire == 0xA5) MsSqlType.VarBinary else (if (wire == 0xAD) MsSqlType.Binary else MsSqlType.Image);
+    } else if (wire == 0xF1) {
+        column.layout = L_PLP;
+        column.cellType = T_TEXT;
+        column.encoding = ENC_UTF16;
+        column.kind = MsSqlType.Xml;
+    } else if (wire == 0xF0) {
+        column.layout = L_PLP; // a CLR type's values are always PLP since TDS 7.2
+        column.cellType = T_BINARY;
+        column.kind = MsSqlType.Udt;
+    } else if (wire == 0x62) {
+        column.layout = L_LONG;
+        column.cellType = T_NULL;
+        column.kind = MsSqlType.Variant;
+    } else {
+        return false;
+    }
+    return true;
+}
+
+fn intKind(length: usize) -> MsSqlType => match (length) {
+    1 => MsSqlType.TinyInt,
+    2 => MsSqlType.SmallInt,
+    4 => MsSqlType.Int,
+    _ => MsSqlType.BigInt,
+};
+
+/// Skips a B_VARCHAR (one-byte count of UTF-16 units) at `at`; null when it runs past `data`.
+fn skipBVarchar(data: Slice<u8>, at: usize) -> usize? {
+    if (at + 1 > data.length) {
+        return null;
+    }
+    let end = at + 1 + (data[at] as usize) * 2;
+    return if (end > data.length) null else Some(end);
+}
+
+/// Skips a US_VARCHAR (two-byte count of UTF-16 units) at `at`; null when it runs past `data`.
+fn skipUsVarchar(data: Slice<u8>, at: usize) -> usize? {
+    if (at + 2 > data.length) {
+        return null;
+    }
+    let end = at + 2 + (data.readLE<u16>(at) as usize) * 2;
+    return if (end > data.length) null else Some(end);
+}
+
+/// Skips `short` B_VARCHARs then one US_VARCHAR at `at`; null when they run past `data`.
+fn skipNames(data: Slice<u8>, at: usize, short: usize) -> usize? {
+    var pos = at;
+    for (k in 0..short) {
+        pos = skipBVarchar(data, pos)?;
+    }
+    return skipUsVarchar(data, pos);
+}
+
+/// Reads a TYPE_INFO (MS-TDS 2.2.5.6) at `at` into `column`; the position after it, or null when it runs past
+/// `data`. `withTable`: in COLMETADATA, where text, ntext and image are followed by their table's name.
+fn readTypeInfo(
+    data: Slice<u8>,
+    at: usize,
+    column: borrow mut MsColumn,
+    withTable: bool,
+) -> Result<usize?, MsSqlError> {
+    if (at + 1 > data.length) {
+        return Ok(null);
+    }
+    let wire = data[at];
+    var pos = at + 1;
+    if (!describeWire(wire, column)) {
+        return Err(MsSqlError.Protocol);
+    }
+    if (wire == 0x26 || wire == 0x68 || wire == 0x6D || wire == 0x6E || wire == 0x6F || wire == 0x24) {
+        if (pos + 1 > data.length) {
+            return Ok(null);
+        }
+        let length = data[pos] as usize;
+        pos += 1;
+        column.maxLength = 0;
+        if (wire == 0x26) {
+            column.kind = intKind(length);
+        } else if (wire == 0x6D) {
+            column.kind = if (length == 4) MsSqlType.Real else MsSqlType.Float;
+        } else if (wire == 0x6E) {
+            column.kind = if (length == 4) MsSqlType.SmallMoney else MsSqlType.Money;
+        } else if (wire == 0x6F) {
+            column.kind = if (length == 4) MsSqlType.SmallDateTime else MsSqlType.DateTime;
+        }
+    } else if (wire == 0x6A || wire == 0x6C || wire == 0x37 || wire == 0x3F) {
+        if (pos + 3 > data.length) {
+            return Ok(null);
+        }
+        column.precision = data[pos + 1];
+        column.scale = data[pos + 2];
+        pos += 3;
+    } else if (wire == 0x29 || wire == 0x2A || wire == 0x2B) {
+        if (pos + 1 > data.length) {
+            return Ok(null);
+        }
+        column.scale = data[pos];
+        pos += 1;
+    } else if (wire == 0xA5 || wire == 0xAD) {
+        if (pos + 2 > data.length) {
+            return Ok(null);
+        }
+        let length = data.readLE<u16>(pos);
+        pos += 2;
+        column.maxLength = if (length == 0xFFFF) 0u32 else length as u32;
+        if (length == 0xFFFF) {
+            column.layout = L_PLP;
+        }
+    } else if (wire == 0xA7 || wire == 0xAF || wire == 0xE7 || wire == 0xEF) {
+        if (pos + 7 > data.length) {
+            return Ok(null);
+        }
+        let length = data.readLE<u16>(pos);
+        column.maxLength = if (length == 0xFFFF) 0u32 else length as u32;
+        if (length == 0xFFFF) {
+            column.layout = L_PLP;
+        }
+        if (column.encoding == ENC_CODE_PAGE) {
+            column.codePage = collationCodePage(data[pos + 2..pos + 7]);
+        }
+        pos += 7;
+    } else if (wire == 0x22 || wire == 0x23 || wire == 0x63) {
+        if (pos + 4 > data.length) {
+            return Ok(null);
+        }
+        column.maxLength = data.readLE<u32>(pos);
+        pos += 4;
+        if (wire != 0x22) {
+            if (pos + 5 > data.length) {
+                return Ok(null);
+            }
+            if (column.encoding == ENC_CODE_PAGE) {
+                column.codePage = collationCodePage(data[pos..pos + 5]);
+            }
+            pos += 5;
+        }
+        if (withTable) {
+            if (pos + 1 > data.length) {
+                return Ok(null);
+            }
+            let parts = data[pos] as usize;
+            pos += 1;
+            for (k in 0..parts) {
+                pos = skipUsVarchar(data, pos) ?? { return Ok(null); };
+            }
+        }
+    } else if (wire == 0xF1) {
+        if (pos + 1 > data.length) {
+            return Ok(null);
+        }
+        let schema = data[pos];
+        pos += 1;
+        if (schema != 0) {
+            // The database, the owning schema and the XML schema collection's names.
+            pos = skipNames(data, pos, 2) ?? { return Ok(null); };
+        }
+    } else if (wire == 0xF0) {
+        if (pos + 2 > data.length) {
+            return Ok(null);
+        }
+        let length = data.readLE<u16>(pos);
+        pos += 2;
+        column.maxLength = if (length == 0xFFFF) 0u32 else length as u32;
+        // The database, schema and type names, then the assembly-qualified name.
+        pos = skipNames(data, pos, 3) ?? { return Ok(null); };
+    } else if (wire == 0x62) {
+        if (pos + 4 > data.length) {
+            return Ok(null);
+        }
+        column.maxLength = data.readLE<u32>(pos);
+        pos += 4;
+    }
+    return Ok(Some(pos));
+}
+
+/// Reads a COLMETADATA token's body (after its type byte) at `at` into `meta`; the position after it, or null when
+/// it runs past `data`.
+fn readColumnMetadata(data: Slice<u8>, at: usize, meta: borrow mut MsMeta) -> Result<usize?, MsSqlError> {
+    meta.clear();
+    if (at + 2 > data.length) {
+        return Ok(null);
+    }
+    let count = data.readLE<u16>(at) as usize;
+    var pos = at + 2;
+    if (count == 0xFFFF) {
+        return Ok(Some(pos)); // no metadata
+    }
+    allocated(meta.columns.reserve(count))?;
+    for (i in 0..count) {
+        if (pos + 6 > data.length) {
+            return Ok(null);
+        }
+        let userType = data.readLE<u32>(pos);
+        var column = blankColumn();
+        column.flags = data.readLE<u16>(pos + 4);
+        pos += 6;
+        pos = readTypeInfo(data, pos, mut column, true)? ?? { return Ok(null); };
+        if (userType == 80) {
+            column.kind = MsSqlType.Timestamp; // rowversion: binary(8) with its own user type
+        }
+        if (pos + 1 > data.length) {
+            return Ok(null);
+        }
+        let units = data[pos] as usize;
+        let nameEnd = pos + 1 + units * 2;
+        if (nameEnd > data.length) {
+            return Ok(null);
+        }
+        column.nameAt = meta.names.length;
+        allocated(Utf16.decodeBytes(data[pos + 1..nameEnd], mut meta.names))?;
+        column.nameLength = meta.names.length - column.nameAt;
+        pos = nameEnd;
+        allocated(meta.columns.push(column))?;
+    }
+    return Ok(Some(pos));
+}
+
+/// UTF-8 `bytes`, built here, appended to a `String` (checked once by `appendUtf8`; they are always UTF-8).
+fn appendBytes(out: borrow mut String, bytes: Slice<u8>) -> Result<void, AllocError> {
+    let _ = out.appendUtf8(bytes)?;
+    return Ok();
+}
+
+/// `text` as a JSON string, quoted and escaped.
+fn jsonString(text: Slice<u8>, out: borrow mut Vector<u8>) -> Result<void, AllocError> {
+    let hex = "0123456789abcdef".bytes();
+    out.push('"')?;
+    for (c in text) {
+        if (c == '"' || c == '\\') {
+            out.push('\\')?;
+            out.push(c)?;
+        } else if (c == '\n') {
+            out.extend("\\n".bytes())?;
+        } else if (c == '\r') {
+            out.extend("\\r".bytes())?;
+        } else if (c == '\t') {
+            out.extend("\\t".bytes())?;
+        } else if (c < 0x20) {
+            out.extend("\\u00".bytes())?;
+            out.push(hex[(c >> 4) as usize])?;
+            out.push(hex[(c & 0x0F) as usize])?;
+        } else {
+            out.push(c)?;
+        }
+    }
+    return out.push('"');
+}
+
+/// A Markdown table cell: `|` escaped, line breaks as spaces.
+fn markdownCell(text: Slice<u8>, out: borrow mut Vector<u8>) -> Result<void, AllocError> {
+    for (c in text) {
+        if (c == '|') {
+            out.extend("\\|".bytes())?;
+        } else if (c == '\n' || c == '\r') {
+            out.push(' ')?;
+        } else {
+            out.push(c)?;
+        }
+    }
+    return Ok();
+}
+
+/// `bytes` in base64 (RFC 4648, with padding).
+fn base64(bytes: Slice<u8>, out: borrow mut Vector<u8>) -> Result<void, AllocError> {
+    let alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/".bytes();
+    var i: usize = 0;
+    while (i + 3 <= bytes.length) {
+        let v = ((bytes[i] as u32) << 16) | ((bytes[i + 1] as u32) << 8) | (bytes[i + 2] as u32);
+        out.push(alphabet[(v >> 18) as usize])?;
+        out.push(alphabet[((v >> 12) & 0x3F) as usize])?;
+        out.push(alphabet[((v >> 6) & 0x3F) as usize])?;
+        out.push(alphabet[(v & 0x3F) as usize])?;
+        i += 3;
+    }
+    let rest = bytes.length - i;
+    if (rest == 1) {
+        let v = (bytes[i] as u32) << 16;
+        out.push(alphabet[(v >> 18) as usize])?;
+        out.push(alphabet[((v >> 12) & 0x3F) as usize])?;
+        out.extend("==".bytes())?;
+    } else if (rest == 2) {
+        let v = ((bytes[i] as u32) << 16) | ((bytes[i + 1] as u32) << 8);
+        out.push(alphabet[(v >> 18) as usize])?;
+        out.push(alphabet[((v >> 12) & 0x3F) as usize])?;
+        out.push(alphabet[((v >> 6) & 0x3F) as usize])?;
+        out.push('=')?;
+    }
+    return Ok();
+}

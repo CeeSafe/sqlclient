@@ -1,0 +1,587 @@
+import tls.TlsConfig;
+
+/// Whether and how a connection is encrypted, as `Encrypt` in a connection string.
+public enum MsEncrypt {
+    /// `Encrypt=false` (`Optional`): the login is encrypted, the session only if the server requires it. A server
+    /// that cannot encrypt at all gets the login in the clear.
+    Optional,
+    /// `Encrypt=true` (`Mandatory`, the default): the whole session is encrypted, TDS 7.4 style (TLS negotiated
+    /// inside PRELOGIN).
+    Mandatory,
+    /// `Encrypt=strict`: TDS 8.0, TLS before anything else, as SQL Server 2022 and Azure SQL offer. The server's
+    /// certificate is always checked unless `TrustServerCertificate`.
+    Strict,
+}
+
+const DEFAULT_PORT: u16 = 1433;
+const DEFAULT_PACKET_SIZE: u32 = 8000;
+const DEFAULT_CONNECT_TIMEOUT_MS: u64 = 15000;
+const DEFAULT_COMMAND_TIMEOUT_MS: u64 = 30000;
+const DEFAULT_MAX_POOL: usize = 100;
+
+/// Where and how to connect. Build one with `create` or `parse`, then share it: connections only borrow it, and
+/// its TLS configuration (with the trusted roots loaded once) serves every connection.
+@noncopy
+public struct MsSqlConfig {
+    private hostName: String;
+    private portNumber: u16;
+    /// A named instance, found through SQL Server Browser when no port is given.
+    private instanceName: String;
+    private databaseName: String;
+    private userName: String;
+    private secret: String;
+    private domainName: String;
+    private integrated: bool;
+    private encryptMode: MsEncrypt;
+    private trustCertificate: bool;
+    private certificateName: String;
+    private application: String;
+    private workstationName: String;
+    private languageName: String;
+    private connectMillis: u64;
+    private commandMillis: u64;
+    private packetBytes: u32;
+    private readOnly: bool;
+    private poolSize: usize;
+    private tlsConfig: TlsConfig?;
+
+    fn empty() -> MsSqlConfig => MsSqlConfig {
+        hostName: String.create(),
+        portNumber: 0,
+        instanceName: String.create(),
+        databaseName: String.create(),
+        userName: String.create(),
+        secret: String.create(),
+        domainName: String.create(),
+        integrated: false,
+        encryptMode: MsEncrypt.Mandatory,
+        trustCertificate: false,
+        certificateName: String.create(),
+        application: String.create(),
+        workstationName: String.create(),
+        languageName: String.create(),
+        connectMillis: DEFAULT_CONNECT_TIMEOUT_MS,
+        commandMillis: DEFAULT_COMMAND_TIMEOUT_MS,
+        packetBytes: DEFAULT_PACKET_SIZE,
+        readOnly: false,
+        poolSize: DEFAULT_MAX_POOL,
+        tlsConfig: null,
+    };
+
+    /// A SQL login `user` on `host`:1433, database `database`, encrypted and with the certificate checked.
+    public fn create(
+        host: StringView,
+        user: StringView,
+        password: StringView,
+        database: StringView,
+    ) -> Result<MsSqlConfig, MsSqlError> {
+        var config = MsSqlConfig.empty();
+        allocated(config.hostName.append(host))?;
+        allocated(config.userName.append(user))?;
+        allocated(config.secret.append(password))?;
+        allocated(config.databaseName.append(database))?;
+        config.portNumber = DEFAULT_PORT;
+        config.finish()?;
+        return Ok(config);
+    }
+
+    /// Reads a connection string, in either form:
+    ///
+    /// - ADO.NET: `Server=tcp:db.example.org,1433;Database=shop;User Id=app;Password=secret;Encrypt=true`. Keys are
+    ///   case-insensitive; a value may be quoted with `'` or `"` (a quote doubled inside), so it may hold `;`.
+    /// - a URL: `sqlserver://app:secret@db.example.org:1433/INSTANCE?database=shop&encrypt=strict` (`mssql://`
+    ///   too; percent-escapes are decoded, and the other keys are those of the ADO.NET form).
+    ///
+    /// The server is `host`, `host,port`, `tcp:host,port`, `host\instance` (its port found through SQL Server
+    /// Browser), `[v6 address],port`, or `.`/`(local)` for localhost. The keys known are `Server` (`Data Source`,
+    /// `Address`, `Addr`, `Network Address`), `Database` (`Initial Catalog`), `User Id` (`UID`, `User`, `User
+    /// Name`), `Password` (`PWD`), `Domain`, `Integrated Security` (`Trusted_Connection`), `Encrypt` (`true`,
+    /// `false`, `yes`, `no`, `mandatory`, `optional`, `strict`), `TrustServerCertificate`, `HostNameInCertificate`,
+    /// `Application Name` (`App`), `Workstation ID` (`WSID`), `Current Language` (`Language`), `Connect Timeout`
+    /// (`Connection Timeout`, `Timeout`) and `Command Timeout` in seconds, `Packet Size`, `ApplicationIntent`
+    /// (`ReadOnly`, `ReadWrite`) and `Max Pool Size`. Others are ignored.
+    public fn parse(text: StringView) -> Result<MsSqlConfig, MsSqlError> {
+        var config = MsSqlConfig.empty();
+        let trimmed = text.trim();
+        if (startsWithIgnoreCase(trimmed, "sqlserver://") || startsWithIgnoreCase(trimmed, "mssql://")) {
+            config.readUrl(trimmed)?;
+        } else {
+            config.readPairs(trimmed)?;
+        }
+        if (config.hostName.length == 0) {
+            return Err(MsSqlError.Config);
+        }
+        if (config.portNumber == 0 && config.instanceName.length == 0) {
+            config.portNumber = DEFAULT_PORT;
+        }
+        config.finish()?;
+        return Ok(config);
+    }
+
+    /// Loads the TLS configuration the settings call for.
+    fn finish(borrow mut this) -> Result<void, MsSqlError> {
+        if (this.application.length == 0) {
+            allocated(this.application.append("sqlclient"))?;
+        }
+        if (this.workstationName.length == 0) {
+            let host = Environment.variable("HOSTNAME") ?? "localhost";
+            allocated(this.workstationName.append(if (host.length > 0 && host.length <= 128) host else "localhost"))?;
+        }
+        var tlsConfig = match (if (this.trustCertificate) TlsConfig.clientWithoutRoots() else TlsConfig.client()) {
+            Ok(t) => t,
+            Err(e) => { return Err(MsSqlError.Tls(e)); }
+        };
+        if (this.trustCertificate) {
+            tlsConfig.verifyPeer(false);
+        }
+        match (this.encryptMode) {
+            MsEncrypt.Strict => {
+                let protocols = ["tds/8.0"];
+                match (tlsConfig.alpn(protocols[..])) {
+                    Ok() => {}
+                    Err(e) => { return Err(MsSqlError.Tls(e)); }
+                }
+            }
+            _ => {}
+        }
+        this.tlsConfig = tlsConfig;
+        return Ok();
+    }
+
+    // ---- Reading ----
+
+    /// `key=value;…` pairs.
+    fn readPairs(borrow mut this, text: StringView) -> Result<void, MsSqlError> {
+        let b = text.bytes();
+        var at: usize = 0;
+        var key = Vector<u8>.create();
+        var value = Vector<u8>.create();
+        while (at < b.length) {
+            // The key runs to '='; a doubled '==' is an '=' in it.
+            key.clear();
+            value.clear();
+            while (at < b.length && b[at] != '=' && b[at] != ';') {
+                allocated(key.push(b[at]))?;
+                at += 1;
+            }
+            if (at >= b.length || b[at] == ';') {
+                // A key without a value: empty pairs (`;;`) are allowed, others are not.
+                if (key.view().trim().length > 0) {
+                    return Err(MsSqlError.Config);
+                }
+                at += 1;
+                continue;
+            }
+            at += 1; // '='
+            while (at < b.length && (b[at] == ' ' || b[at] == '\t')) {
+                at += 1;
+            }
+            if (at < b.length && (b[at] == '\'' || b[at] == '"')) {
+                let quote = b[at];
+                at += 1;
+                var closed = false;
+                while (at < b.length) {
+                    if (b[at] == quote) {
+                        if (at + 1 < b.length && b[at + 1] == quote) {
+                            allocated(value.push(quote))?;
+                            at += 2;
+                            continue;
+                        }
+                        at += 1;
+                        closed = true;
+                        break;
+                    }
+                    allocated(value.push(b[at]))?;
+                    at += 1;
+                }
+                if (!closed) {
+                    return Err(MsSqlError.Config);
+                }
+                while (at < b.length && (b[at] == ' ' || b[at] == '\t')) {
+                    at += 1;
+                }
+                if (at < b.length && b[at] != ';') {
+                    return Err(MsSqlError.Config);
+                }
+            } else {
+                while (at < b.length && b[at] != ';') {
+                    allocated(value.push(b[at]))?;
+                    at += 1;
+                }
+            }
+            at += 1; // ';'
+            let k = StringView.fromUtf8(key.view()) ?? "";
+            let quotedValue = StringView.fromUtf8(value.view());
+            match (quotedValue) {
+                Some(v) => { this.set(k.trim(), v.trim())?; }
+                null => { return Err(MsSqlError.Config); }
+            }
+        }
+        return Ok();
+    }
+
+    /// `sqlserver://user:password@host:port/instance?key=value&…`.
+    fn readUrl(borrow mut this, url: StringView) -> Result<void, MsSqlError> {
+        var lo = match (url.indexOf("://")) {
+            Some(i) => i + 3,
+            null => { return Err(MsSqlError.Config); }
+        };
+        var hi = url.length;
+        var queryAt = url.length;
+        match (url[lo..].indexOfByte('?')) {
+            Some(q) => {
+                queryAt = lo + q + 1;
+                hi = lo + q;
+            }
+            null => {}
+        }
+        match (url[lo..hi].indexOfByte('/')) {
+            Some(p) => {
+                let instance = url[lo + p + 1..hi];
+                percentDecode(instance, mut this.instanceName)?;
+                hi = lo + p;
+            }
+            null => {}
+        }
+        match (url[lo..hi].lastIndexOf("@")) {
+            Some(at) => {
+                let credentials = url[lo..lo + at];
+                lo = lo + at + 1;
+                match (credentials.splitOnce(":")) {
+                    Some(halves) => {
+                        percentDecode(halves.left, mut this.userName)?;
+                        percentDecode(halves.right, mut this.secret)?;
+                    }
+                    null => { percentDecode(credentials, mut this.userName)?; }
+                }
+            }
+            null => {}
+        }
+        let authority = url[lo..hi];
+        if (authority.startsWith("[")) {
+            let close = authority.indexOfByte(']') ?? { return Err(MsSqlError.Config); };
+            allocated(this.hostName.append(authority[1..close]))?;
+            let rest = authority[close + 1..];
+            if (rest.length > 0) {
+                if (!rest.startsWith(":")) {
+                    return Err(MsSqlError.Config);
+                }
+                this.portNumber = parsePort(rest[1..])?;
+            }
+        } else {
+            match (authority.lastIndexOf(":")) {
+                Some(colon) => {
+                    allocated(this.hostName.append(authority[0..colon]))?;
+                    this.portNumber = parsePort(authority[colon + 1..])?;
+                }
+                null => { allocated(this.hostName.append(authority))?; }
+            }
+        }
+        if (queryAt < url.length) {
+            for (pair in url[queryAt..].split("&")) {
+                match (pair.splitOnce("=")) {
+                    Some(halves) => {
+                        var key = String.create();
+                        var value = String.create();
+                        percentDecode(halves.left, mut key)?;
+                        percentDecode(halves.right, mut value)?;
+                        this.set(key.view(), value.view())?;
+                    }
+                    null => {
+                        if (pair.length > 0) {
+                            return Err(MsSqlError.Config);
+                        }
+                    }
+                }
+            }
+        }
+        return Ok();
+    }
+
+    /// Takes one setting.
+    fn set(borrow mut this, key: StringView, value: StringView) -> Result<void, MsSqlError> {
+        if (isKey(key, "server") || isKey(key, "data source") || isKey(key, "address") || isKey(key, "addr") ||
+            isKey(key, "network address")) {
+            return this.setServer(value);
+        }
+        if (isKey(key, "database") || isKey(key, "initial catalog")) {
+            return replaceText(mut this.databaseName, value);
+        }
+        if (isKey(key, "user id") || isKey(key, "uid") || isKey(key, "user") || isKey(key, "user name") ||
+            isKey(key, "username")) {
+            return replaceText(mut this.userName, value);
+        }
+        if (isKey(key, "password") || isKey(key, "pwd")) {
+            return replaceText(mut this.secret, value);
+        }
+        if (isKey(key, "domain")) {
+            return replaceText(mut this.domainName, value);
+        }
+        if (isKey(key, "integrated security") || isKey(key, "trusted_connection")) {
+            this.integrated = value.equalsIgnoreAsciiCase("sspi") || parseBool(value)?;
+            return Ok();
+        }
+        if (isKey(key, "encrypt")) {
+            if (value.equalsIgnoreAsciiCase("strict")) {
+                this.encryptMode = MsEncrypt.Strict;
+            } else if (value.equalsIgnoreAsciiCase("mandatory")) {
+                this.encryptMode = MsEncrypt.Mandatory;
+            } else if (value.equalsIgnoreAsciiCase("optional")) {
+                this.encryptMode = MsEncrypt.Optional;
+            } else {
+                this.encryptMode = if (parseBool(value)?) MsEncrypt.Mandatory else MsEncrypt.Optional;
+            }
+            return Ok();
+        }
+        if (isKey(key, "trustservercertificate") || isKey(key, "trust server certificate")) {
+            this.trustCertificate = parseBool(value)?;
+            return Ok();
+        }
+        if (isKey(key, "hostnameincertificate") || isKey(key, "host name in certificate")) {
+            return replaceText(mut this.certificateName, value);
+        }
+        if (isKey(key, "application name") || isKey(key, "app") || isKey(key, "applicationname")) {
+            return replaceText(mut this.application, value);
+        }
+        if (isKey(key, "workstation id") || isKey(key, "wsid")) {
+            return replaceText(mut this.workstationName, value);
+        }
+        if (isKey(key, "current language") || isKey(key, "language")) {
+            return replaceText(mut this.languageName, value);
+        }
+        if (isKey(key, "connect timeout") || isKey(key, "connection timeout") || isKey(key, "timeout") ||
+            isKey(key, "connecttimeout")) {
+            this.connectMillis = parseSeconds(value)?;
+            return Ok();
+        }
+        if (isKey(key, "command timeout") || isKey(key, "commandtimeout")) {
+            this.commandMillis = parseSeconds(value)?;
+            return Ok();
+        }
+        if (isKey(key, "packet size") || isKey(key, "packetsize")) {
+            let n = value.parseInt<u32>() ?? 0;
+            if (n < 512 || n > 32767) {
+                return Err(MsSqlError.Config);
+            }
+            this.packetBytes = n;
+            return Ok();
+        }
+        if (isKey(key, "applicationintent") || isKey(key, "application intent")) {
+            if (value.equalsIgnoreAsciiCase("readonly")) {
+                this.readOnly = true;
+            } else if (value.equalsIgnoreAsciiCase("readwrite")) {
+                this.readOnly = false;
+            } else {
+                return Err(MsSqlError.Config);
+            }
+            return Ok();
+        }
+        if (isKey(key, "max pool size") || isKey(key, "maxpoolsize")) {
+            let n = value.parseInt<usize>() ?? 0;
+            if (n == 0) {
+                return Err(MsSqlError.Config);
+            }
+            this.poolSize = n;
+            return Ok();
+        }
+        return Ok();
+    }
+
+    /// `host`, `host,port`, `tcp:host,port`, `host\instance`, `[v6],port`, `.` or `(local)`.
+    fn setServer(borrow mut this, text: StringView) -> Result<void, MsSqlError> {
+        var server = text.trim();
+        if (startsWithIgnoreCase(server, "np:") || startsWithIgnoreCase(server, "lpc:") ||
+            startsWithIgnoreCase(server, "admin:")) {
+            return Err(MsSqlError.Config); // named pipes, shared memory and the DAC are not supported
+        }
+        if (startsWithIgnoreCase(server, "tcp:")) {
+            server = server[4..].trim();
+        }
+        this.hostName.clear();
+        this.instanceName.clear();
+        this.portNumber = 0;
+        match (server.lastIndexOf(",")) {
+            Some(comma) => {
+                this.portNumber = parsePort(server[comma + 1..].trim())?;
+                server = server[0..comma].trim();
+            }
+            null => {}
+        }
+        match (server.indexOf("\\")) {
+            Some(slash) => {
+                allocated(this.instanceName.append(server[slash + 1..].trim()))?;
+                server = server[0..slash].trim();
+            }
+            null => {}
+        }
+        if (server.length >= 2 && server.startsWith("[") && server.endsWith("]")) {
+            server = server[1..server.length - 1];
+        }
+        if (server == "." || server.equalsIgnoreAsciiCase("(local)") || server.equalsIgnoreAsciiCase("(localdb)")) {
+            server = "localhost";
+        }
+        return replaceText(mut this.hostName, server);
+    }
+
+    // ---- Settings ----
+
+    /// Sets the port (and forgets a named instance's lookup).
+    public fn setPort(borrow mut this, port: u16) {
+        this.portNumber = port;
+    }
+
+    /// Sets how the connection is encrypted, and reloads the TLS configuration.
+    public fn setEncrypt(borrow mut this, mode: MsEncrypt) -> Result<void, MsSqlError> {
+        this.encryptMode = mode;
+        return this.finish();
+    }
+
+    /// Trusts the server's certificate without checking it, as `TrustServerCertificate=true`: for development
+    /// servers with self-signed certificates only, since anyone on the path could then pose as the server.
+    public fn setTrustServerCertificate(borrow mut this, trust: bool) -> Result<void, MsSqlError> {
+        this.trustCertificate = trust;
+        return this.finish();
+    }
+
+    /// Uses `tlsConfig` instead (a private CA with `trustPem`, a client certificate, a minimum version). For
+    /// `Encrypt=strict` it must offer the ALPN protocol `tds/8.0`.
+    public fn useTls(borrow mut this, tlsConfig: TlsConfig) {
+        this.tlsConfig = tlsConfig;
+    }
+
+    /// Sets the command timeout in milliseconds (0: none).
+    public fn setCommandTimeout(borrow mut this, millis: u64) {
+        this.commandMillis = millis;
+    }
+
+    /// Sets the connect timeout in milliseconds (0: none).
+    public fn setConnectTimeout(borrow mut this, millis: u64) {
+        this.connectMillis = millis;
+    }
+
+    /// Sets the application name the server sees (`APP_NAME()`).
+    public fn setApplicationName(borrow mut this, name: StringView) -> Result<void, MsSqlError> =>
+        replaceText(mut this.application, name);
+
+    // ---- Reading the settings ----
+
+    /// The server's host name or address.
+    public fn host(borrow this) -> StringView => this.hostName.view();
+    /// The port, or 0 when it is to be found through SQL Server Browser.
+    public fn port(borrow this) -> u16 => this.portNumber;
+    /// The named instance, or empty.
+    public fn instance(borrow this) -> StringView => this.instanceName.view();
+    /// The database to open at login (empty: the login's default).
+    public fn database(borrow this) -> StringView => this.databaseName.view();
+    /// The login name (or the Windows account's, with NTLM).
+    public fn user(borrow this) -> StringView => this.userName.view();
+    fn password(borrow this) -> StringView => this.secret.view();
+    /// The Windows domain, for NTLM.
+    public fn domain(borrow this) -> StringView => this.domainName.view();
+    /// Whether the login uses a Windows account (NTLM).
+    public fn usesWindowsLogin(borrow this) -> bool => this.integrated || this.domainName.length > 0;
+    /// How the connection is encrypted.
+    public fn encrypt(borrow this) -> MsEncrypt => this.encryptMode;
+    /// Whether the server's certificate is accepted without being checked.
+    public fn trustsServerCertificate(borrow this) -> bool => this.trustCertificate;
+    /// The application name the server sees (`APP_NAME()`).
+    public fn applicationName(borrow this) -> StringView => this.application.view();
+    /// The client's name the server sees (`HOST_NAME()`).
+    public fn workstation(borrow this) -> StringView => this.workstationName.view();
+    /// The session's language (empty: the login's default).
+    public fn language(borrow this) -> StringView => this.languageName.view();
+    /// The connect timeout in milliseconds (0: none).
+    public fn connectTimeout(borrow this) -> u64 => this.connectMillis;
+    /// The command timeout in milliseconds (0: none).
+    public fn commandTimeout(borrow this) -> u64 => this.commandMillis;
+    /// The packet size asked for at login.
+    public fn packetSize(borrow this) -> u32 => this.packetBytes;
+    /// Whether the login says `ApplicationIntent=ReadOnly`, for a readable secondary replica.
+    public fn readOnlyIntent(borrow this) -> bool => this.readOnly;
+    /// `Max Pool Size`: the size `MsSqlPool.fromConfig` gives a pool.
+    public fn maxPoolSize(borrow this) -> usize => this.poolSize;
+    /// The name the server's certificate must carry: `HostNameInCertificate`, else the host.
+    fn certificateHost(borrow this) -> StringView =>
+        if (this.certificateName.length > 0) this.certificateName.view() else this.hostName.view();
+    fn tls(borrow this) -> borrow (TlsConfig?) => borrow this.tlsConfig;
+}
+
+fn replaceText(target: borrow mut String, value: StringView) -> Result<void, MsSqlError> {
+    target.clear();
+    return allocated(target.append(value));
+}
+
+fn isKey(key: StringView, name: StringView) -> bool => key.equalsIgnoreAsciiCase(name);
+
+fn startsWithIgnoreCase(text: StringView, prefix: StringView) -> bool =>
+    text.length >= prefix.length && text.bytes()[0..prefix.length].equalsIgnoreAsciiCase(prefix.bytes());
+
+fn parseBool(value: StringView) -> Result<bool, MsSqlError> {
+    if (value.equalsIgnoreAsciiCase("true") || value.equalsIgnoreAsciiCase("yes") || value == "1") {
+        return Ok(true);
+    }
+    if (value.equalsIgnoreAsciiCase("false") || value.equalsIgnoreAsciiCase("no") || value == "0") {
+        return Ok(false);
+    }
+    return Err(MsSqlError.Config);
+}
+
+fn parsePort(text: StringView) -> Result<u16, MsSqlError> {
+    match (text.parseInt<u16>()) {
+        Some(p) => {
+            if (p == 0) {
+                return Err(MsSqlError.Config);
+            }
+            return Ok(p);
+        }
+        null => { return Err(MsSqlError.Config); }
+    }
+}
+
+/// Seconds as milliseconds; 0 is no limit.
+fn parseSeconds(text: StringView) -> Result<u64, MsSqlError> {
+    match (text.parseInt<u64>()) {
+        Some(s) => {
+            if (s > 2147483) {
+                return Err(MsSqlError.Config);
+            }
+            return Ok(s * 1000);
+        }
+        null => { return Err(MsSqlError.Config); }
+    }
+}
+
+/// `text` with `%XX` escapes decoded, appended to `out`.
+fn percentDecode(text: StringView, out: borrow mut String) -> Result<void, MsSqlError> {
+    let b = text.bytes();
+    var bytes = Vector<u8>.create();
+    var i: usize = 0;
+    while (i < b.length) {
+        if (b[i] == '%' && i + 2 < b.length + 0 && i + 2 <= b.length - 1) {
+            let hi = hexValue(b[i + 1]);
+            let lo = hexValue(b[i + 2]);
+            match (hi) {
+                Some(h) => {
+                    match (lo) {
+                        Some(l) => {
+                            allocated(bytes.push((h << 4) | l))?;
+                            i += 3;
+                            continue;
+                        }
+                        null => { return Err(MsSqlError.Config); }
+                    }
+                }
+                null => { return Err(MsSqlError.Config); }
+            }
+        }
+        if (b[i] == '%') {
+            return Err(MsSqlError.Config);
+        }
+        allocated(bytes.push(b[i]))?;
+        i += 1;
+    }
+    match (StringView.fromUtf8(bytes.view())) {
+        Some(t) => { return allocated(out.append(t)); }
+        null => { return Err(MsSqlError.Config); }
+    }
+}

@@ -1,0 +1,225 @@
+// The sqlclient side of the benchmark against Microsoft.Data.SqlClient (benchmarks/run.py runs both).
+// Usage: bench <scenario> <warmup> <iterations>, with the connection string in MSSQL_CONNECTION.
+// Prints one `sample <nanoseconds>` line per timed iteration, then `check <value>` (a checksum of what was read,
+// which the .NET side must match).
+import sqlclient.MsSqlConfig;
+import sqlclient.MsSqlConnection;
+import sqlclient.MsSqlError;
+import sqlclient.MsSqlErrors;
+import sqlclient.MsSqlParams;
+import sqlclient.MsSqlPool;
+import sqlclient.MsSqlRows;
+
+const ROWS: i64 = 100000;
+const POOL_TASKS: u32 = 16;
+const POOL_QUERIES: u32 = 25;
+const INSERTS: i32 = 100;
+
+extern "C" {
+    /// The process's CPU time (user + system, every thread) in microseconds: CLOCKS_PER_SEC is 1,000,000 on macOS
+    /// and Linux.
+    @effects()
+    fn clock() -> i64;
+}
+
+async fn say(text: StringView) {
+    match (await AsyncConsole.write(text)) {
+        Ok() => {}
+        Err(_) => {}
+    }
+}
+
+async fn sayNumber(label: StringView, value: u64) {
+    var line = String.create();
+    let _ = line.append(label);
+    let _ = line.append(" ");
+    let _ = line.appendNumber(value);
+    let _ = line.append("\n");
+    await say(line.view());
+}
+
+/// The table every scenario reads: ROWS rows of six types, made once.
+async fn setUp(config: borrow MsSqlConfig) -> Result<u64, MsSqlError> {
+    var db = await MsSqlConnection.connect(config)?;
+    let sql = """
+        IF OBJECT_ID('dbo.bench_rows') IS NULL
+        BEGIN
+            CREATE TABLE dbo.bench_rows (
+                id int NOT NULL PRIMARY KEY, name nvarchar(50) NOT NULL, amount decimal(18,2) NOT NULL,
+                created datetime2(7) NOT NULL, flag bit NOT NULL, tag uniqueidentifier NOT NULL);
+            INSERT dbo.bench_rows (id, name, amount, created, flag, tag)
+            SELECT TOP (100000) n, CONCAT(N'customer ', n, N' ünïcode'), CAST(n AS decimal(18,2)) / 7,
+                   DATEADD(second, n, '2024-01-01T00:00:00'), n % 2, NEWID()
+            FROM (SELECT ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) AS n
+                  FROM sys.all_objects a CROSS JOIN sys.all_objects b) AS numbers;
+        END
+        """;
+    await db.batch(sql)?;
+    let none = MsSqlParams.create();
+    let rows = await db.query("SELECT COUNT(*) FROM dbo.bench_rows", none)?;
+    await db.close()?;
+    return Ok(truncate<u64>(rows.int64(0, 0) ?? 0));
+}
+
+/// One iteration of `scenario`; gives what it read, folded into a number.
+async fn once(
+    scenario: StringView,
+    i: u64,
+    config: borrow MsSqlConfig,
+    db: borrow mut MsSqlConnection,
+    pool: borrow MsSqlPool,
+    batch: borrow mut MsSqlRows,
+    big: StringView,
+) -> Result<u64, MsSqlError> {
+    let none = MsSqlParams.create();
+    if (scenario == "connect") {
+        var fresh = await MsSqlConnection.connect(config)?;
+        await fresh.close()?;
+        return Ok(1);
+    }
+    if (scenario == "select1") {
+        let rows = await db.query("SELECT 1", none)?;
+        return Ok(truncate<u64>(rows.int64(0, 0) ?? 0));
+    }
+    if (scenario == "param") {
+        var p = MsSqlParams.create();
+        p.int32(truncate<i32>(i % 100000) + 1)?;
+        let rows = await db.query("SELECT id, name FROM dbo.bench_rows WHERE id = @p1", p)?;
+        return Ok(truncate<u64>(rows.int64(0, 0) ?? 0) + (rows.text(0, 1) ?? "").length as u64);
+    }
+    if (scenario == "rows") {
+        // Every value of every row, read as its type.
+        var sum: u64 = 0;
+        await db.start("SELECT id, name, amount, created, flag, tag FROM dbo.bench_rows ORDER BY id", none)?;
+        while (await db.fetch(batch, 4096)?) {
+            for (r in 0..batch.rowCount()) {
+                sum += truncate<u64>(batch.int64(r, 0) ?? 0);
+                sum += (batch.text(r, 1) ?? "").length as u64;
+                sum += truncate<u64>(batch.decimal(r, 2)!.toInt64() ?? 1);
+                sum += batch.dateTime(r, 3)!.second as u64;
+                sum += if (batch.bool(r, 4) ?? false) 1u64 else 0u64;
+                sum += batch.guid(r, 5)!.bytes[15] as u64 & 0;
+            }
+        }
+        await db.finish()?;
+        return Ok(sum);
+    }
+    if (scenario == "insert") {
+        await db.begin()?;
+        var p = MsSqlParams.create();
+        for (k in 0..INSERTS) {
+            p.clear();
+            p.int32(k)?;
+            p.text("a row of the insert benchmark")?;
+            p.decimalText("12345.67")?;
+            await db.execute("INSERT #bench_insert (id, name, amount) VALUES (@p1, @p2, @p3)", p)?;
+        }
+        await db.rollback()?;
+        return Ok(truncate<u64>(INSERTS));
+    }
+    if (scenario == "bigvalue") {
+        var p = MsSqlParams.create();
+        p.text(big)?;
+        let rows = await db.query("SELECT @p1", p)?;
+        return Ok((rows.text(0, 0) ?? "").length as u64);
+    }
+    if (scenario == "json") {
+        var text = String.create();
+        await db.queryJson(
+            "SELECT TOP (10000) id, name, amount FROM dbo.bench_rows ORDER BY id FOR JSON PATH",
+            none,
+            mut text,
+        )?;
+        return Ok(text.length as u64);
+    }
+    if (scenario == "pool") {
+        // POOL_TASKS tasks at once, each POOL_QUERIES queries on a leased connection.
+        var total: u64 = 0;
+        await Async.scope(MsSqlError.OutOfMemory, (s) => {
+            for (t in 0..POOL_TASKS) {
+                s.spawn(async move () => {
+                    let noParams = MsSqlParams.create();
+                    for (q in 0..POOL_QUERIES) {
+                        var lease = await pool.acquire()?;
+                        let rows = await lease.connection().query("SELECT 1", noParams)?;
+                        if (rows.int64(0, 0) != Some(1i64)) {
+                            return Err(MsSqlError.Protocol);
+                        }
+                    }
+                    return Ok();
+                });
+            }
+        })?;
+        total = (POOL_TASKS * POOL_QUERIES) as u64;
+        return Ok(total);
+    }
+    return Err(MsSqlError.Config);
+}
+
+/// Safety: the only unsafe calls are to C's clock(), which takes nothing and touches no CeeSafe memory.
+async fn run(
+    config: borrow MsSqlConfig,
+    scenario: StringView,
+    warmup: u64,
+    iterations: u64,
+) -> Result<void, MsSqlError> {
+    if (scenario == "setup") {
+        await sayNumber("check", await setUp(config)?);
+        return Ok();
+    }
+    var db = await MsSqlConnection.connect(config)?;
+    db.setCommandTimeout(0);
+    if (scenario == "insert") {
+        await db.batch("CREATE TABLE #bench_insert (id int, name nvarchar(100), amount decimal(18,2))")?;
+    }
+    let pool = MsSqlPool.create(MsSqlConfig.parse(Environment.variable("MSSQL_CONNECTION")!)?, POOL_TASKS as usize)?;
+    var batch = MsSqlRows.create();
+    var big = String.create();
+    for (k in 0..(1024 * 1024 / 8)) {
+        let _ = big.append("ab12CD34");
+    }
+    var check: u64 = 0;
+    for (i in 0..warmup) {
+        check = await once(scenario, i, config, mut db, pool, mut batch, big.view())?;
+    }
+    let cpuStarted = unsafe { clock() };
+    for (i in 0..iterations) {
+        let started = Clock.monotonicNanos();
+        check = await once(scenario, i, config, mut db, pool, mut batch, big.view())?;
+        await sayNumber("sample", Clock.monotonicNanos() - started);
+    }
+    let cpuUsed = unsafe { clock() } - cpuStarted;
+    await sayNumber("cpu", truncate<u64>(cpuUsed) * 1000);
+    await sayNumber("check", check);
+    await db.close()?;
+    return Ok();
+}
+
+fn main() {
+    let text = match (Environment.variable("MSSQL_CONNECTION")) {
+        Some(t) => t,
+        null => {
+            Console.writeErrorLine("set MSSQL_CONNECTION");
+            Process.exit(2);
+        }
+    };
+    let scenario = Process.argument(1) ?? "select1";
+    let warmup = (Process.argument(2) ?? "3").parseInt<u64>() ?? 3;
+    let iterations = (Process.argument(3) ?? "20").parseInt<u64>() ?? 20;
+    let config = match (MsSqlConfig.parse(text)) {
+        Ok(c) => c,
+        Err(e) => {
+            Console.writeErrorLine(MsSqlErrors.describe(e));
+            Process.exit(2);
+        }
+    };
+    match (Async.run(run(config, scenario, warmup, iterations))) {
+        Ok() => {}
+        Err(e) => {
+            var why = String.create();
+            let _ = MsSqlErrors.explain(e, mut why);
+            Console.writeErrorLine(why.view());
+            Process.exit(1);
+        }
+    }
+}

@@ -1,0 +1,107 @@
+// Runs a SQL batch and prints every result set as tab-separated text, then the server's messages.
+// Usage: query <sql>, with the connection string in MSSQL_CONNECTION:
+//   MSSQL_CONNECTION="Server=db,1433;Database=master;User Id=sa;Password=…;TrustServerCertificate=true" \
+//       query "SELECT name, create_date FROM sys.databases"
+import sqlclient.MsSqlConfig;
+import sqlclient.MsSqlConnection;
+import sqlclient.MsSqlError;
+import sqlclient.MsSqlErrors;
+import sqlclient.MsSqlParams;
+import sqlclient.MsSqlRows;
+
+async fn say(text: StringView) {
+    match (await AsyncConsole.write(text)) {
+        Ok() => {}
+        Err(_) => {}
+    }
+}
+
+async fn printRows(rows: borrow MsSqlRows) -> Result<void, MsSqlError> {
+    var line = String.create();
+    for (c in 0..rows.columnCount()) {
+        if (c > 0) {
+            let _ = line.append("\t");
+        }
+        let _ = line.append(rows.columnName(c));
+    }
+    let _ = line.append("\n");
+    await say(line.view());
+    for (r in 0..rows.rowCount()) {
+        line.clear();
+        for (c in 0..rows.columnCount()) {
+            if (c > 0) {
+                let _ = line.append("\t");
+            }
+            match (rows.writeValue(r, c, mut line)) {
+                Ok(true) => {}
+                Ok(false) => { let _ = line.append("NULL"); }
+                Err(e) => { return Err(e); }
+            }
+        }
+        let _ = line.append("\n");
+        await say(line.view());
+    }
+    return Ok();
+}
+
+async fn run(config: borrow MsSqlConfig, sql: StringView) -> Result<void, MsSqlError> {
+    var connection = await MsSqlConnection.connect(config)?;
+    let none = MsSqlParams.create();
+    let outcome = await connection.queryAll(sql, none);
+    for (m in connection.messages()) {
+        await say(m.message.view());
+        await say("\n");
+    }
+    for (m in connection.errors()) {
+        await say("error: ");
+        await say(m.message.view());
+        await say("\n");
+    }
+    let results = outcome?;
+    for (i in 0..results.count()) {
+        if (i > 0) {
+            await say("\n");
+        }
+        await printRows(results.result(i))?;
+    }
+    var tail = String.create();
+    let _ = tail.append("(");
+    let _ = tail.appendNumber(results.affectedRows());
+    let _ = tail.append(" rows affected)\n");
+    await say(tail.view());
+    await connection.close()?;
+    return Ok();
+}
+
+fn main() {
+    let text = match (Environment.variable("MSSQL_CONNECTION")) {
+        Some(t) => t,
+        null => {
+            Console.writeErrorLine("set MSSQL_CONNECTION to an ADO.NET connection string");
+            Process.exit(2);
+        }
+    };
+    let sql = match (Process.argument(1)) {
+        Some(s) => s,
+        null => {
+            Console.writeErrorLine("usage: query <sql>");
+            Process.exit(2);
+        }
+    };
+    let config = match (MsSqlConfig.parse(text)) {
+        Ok(c) => c,
+        Err(e) => {
+            Console.writeErrorLine(MsSqlErrors.describe(e));
+            Process.exit(2);
+        }
+    };
+    match (Async.run(run(config, sql))) {
+        Ok() => {}
+        Err(e) => {
+            var why = String.create();
+            let _ = MsSqlErrors.explain(e, mut why);
+            Console.writeErrorLine(why.view());
+            Process.exit(1);
+        }
+    }
+}

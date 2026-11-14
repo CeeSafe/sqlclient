@@ -1,0 +1,8 @@
+out/
+bin/
+obj/
+.claude/
+__pycache__/
+*.pyc
+.DS_Store
+*.orig

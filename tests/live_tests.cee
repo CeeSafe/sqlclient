@@ -1,0 +1,855 @@
+// Tests against a real server: MSSQL_TEST_CONNECTION is an ADO.NET connection string, for example
+//   Server=127.0.0.1,1433;Database=master;User Id=sa;Password=…;TrustServerCertificate=true
+// Without it they pass without running, so `ceesafec test` works on a machine with no server. Each scenario is an
+// async fn run with `Async.run(...)`.
+
+/// The test server's configuration, or null to skip.
+fn testConfig() -> MsSqlConfig? {
+    let text = Environment.variable("MSSQL_TEST_CONNECTION")?;
+    match (MsSqlConfig.parse(text)) {
+        Ok(c) => { return c; }
+        Err(_) => {
+            Console.writeErrorLine("MSSQL_TEST_CONNECTION is not a valid connection string");
+            return null;
+        }
+    }
+}
+
+/// Fails the test with `error`, and the server's message when it sent one.
+fn failWith(error: MsSqlError, connection: borrow MsSqlConnection) -> Result<void, TestFailure> {
+    var text = String.create();
+    text.append(MsSqlErrors.describe(error))!;
+    match (connection.lastError()) {
+        Some(m) => {
+            text.append(": ")!;
+            text.append(m.message.view())!;
+        }
+        null => {}
+    }
+    return Check.fail(text.view());
+}
+
+/// A scenario's outcome: Ok, or the error with the server's first message.
+@noncopy
+struct Outcome {
+    error: MsSqlError?;
+    message: String;
+    detail: String;
+}
+
+fn passed() -> Outcome => Outcome { error: null, message: String.create(), detail: String.create() };
+
+fn failed(error: MsSqlError, connection: borrow MsSqlConnection) -> Outcome {
+    var o = passed();
+    o.error = error;
+    match (connection.lastError()) {
+        Some(m) => { o.message.append(m.message.view())!; }
+        null => {}
+    }
+    return o;
+}
+
+fn wrong(what: StringView) -> Outcome {
+    var o = passed();
+    o.error = MsSqlError.Protocol;
+    o.detail.append(what)!;
+    return o;
+}
+
+fn report(outcome: Outcome) -> Result<void, TestFailure> {
+    match (outcome.error) {
+        null => { return Ok(); }
+        Some(e) => {
+            var text = String.create();
+            if (outcome.detail.length > 0) {
+                text.append(outcome.detail.view())!;
+            } else {
+                text.append(MsSqlErrors.describe(e))!;
+                if (outcome.message.length > 0) {
+                    text.append(": ")!;
+                    text.append(outcome.message.view())!;
+                }
+            }
+            return Check.fail(text.view());
+        }
+    }
+}
+
+fn connectFailed(error: MsSqlError) -> Outcome {
+    var o = passed();
+    o.error = error;
+    o.detail.append("connect: ")!;
+    o.detail.append(MsSqlErrors.describe(error))!;
+    return o;
+}
+
+fn valueText(rows: borrow MsSqlRows, row: usize, c: usize) -> String {
+    var s = String.create();
+    let _ = rows.writeValue(row, c, mut s)!;
+    return s;
+}
+
+// ── Connecting ───────────────────────────────────────────────────────────────────────────────────────────────
+
+async fn selectBasics(config: borrow MsSqlConfig) -> Outcome {
+    var db = match (await MsSqlConnection.connect(config)) {
+        Ok(c) => c,
+        Err(e) => { return connectFailed(e); }
+    };
+    let none = MsSqlParams.create();
+    let rows = match (await db.query(
+        "SELECT 1 AS one, N'héllo wörld 😀' AS t, @@SPID AS spid, @@TEXTSIZE AS ts, DB_NAME() AS db",
+        none,
+    )) {
+        Ok(r) => r,
+        Err(e) => { return failed(e, db); }
+    };
+    if (rows.rowCount() != 1 || rows.columnCount() != 5) {
+        return wrong("one row of five columns");
+    }
+    if (rows.int64(0, 0) != Some(1i64)) {
+        return wrong("one");
+    }
+    if (rows.text(0, 1) != Some("héllo wörld 😀")) {
+        return wrong("unicode text");
+    }
+    if (rows.int64(0, 2) != Some(db.processId() as i64)) {
+        return wrong("@@SPID is the packet header's SPID");
+    }
+    if (rows.int64(0, 3) != Some(-1i64) && rows.int64(0, 3) != Some(2147483647i64)) {
+        return wrong("@@TEXTSIZE is unlimited (the ODBC login flag)");
+    }
+    if (rows.text(0, 4)! != db.database()) {
+        return wrong("DB_NAME() is the ENVCHANGE database");
+    }
+    if (db.serverVersion().major < 11) {
+        return wrong("a server version from LOGINACK");
+    }
+    match (await db.close()) {
+        Ok() => {}
+        Err(e) => { return failed(e, db); }
+    }
+    return passed();
+}
+
+@test
+fn connectsAndSelects() -> Result<void, TestFailure> {
+    let config = match (testConfig()) {
+        Some(c) => c,
+        null => { return Ok(); }
+    };
+    return report(Async.run(selectBasics(config)));
+}
+
+async fn wrongPassword(config: borrow MsSqlConfig) -> Outcome {
+    var bad = MsSqlConfig.create(config.host(), config.user(), "definitely-not-the-password", config.database())!;
+    bad.setPort(config.port());
+    bad.setEncrypt(config.encrypt())!;
+    bad.setTrustServerCertificate(config.trustsServerCertificate())!;
+    match (await MsSqlConnection.connect(bad)) {
+        Ok(_) => { return wrong("logged in with a wrong password"); }
+        Err(MsSqlError.Login) => { return passed(); }
+        Err(e) => { return connectFailed(e); }
+    }
+}
+
+@test
+fn wrongPasswordIsRefused() -> Result<void, TestFailure> {
+    let config = match (testConfig()) {
+        Some(c) => c,
+        null => { return Ok(); }
+    };
+    if (config.usesWindowsLogin()) {
+        return Ok();
+    }
+    return report(Async.run(wrongPassword(config)));
+}
+
+async fn optionalEncryption(config: borrow MsSqlConfig) -> Outcome {
+    var optional = MsSqlConfig.create(config.host(), config.user(), config.password(), config.database())!;
+    optional.setPort(config.port());
+    optional.setEncrypt(MsEncrypt.Optional)!;
+    optional.setTrustServerCertificate(config.trustsServerCertificate())!;
+    var db = match (await MsSqlConnection.connect(optional)) {
+        Ok(c) => c,
+        Err(e) => { return connectFailed(e); }
+    };
+    let none = MsSqlParams.create();
+    let rows = match (await db.query(
+        "SELECT encrypt_option FROM sys.dm_exec_connections WHERE session_id = @@SPID",
+        none,
+    )) {
+        Ok(r) => r,
+        Err(e) => { return failed(e, db); }
+    };
+    let says = rows.text(0, 0) ?? "";
+    if ((says == "TRUE") != db.isEncrypted()) {
+        return wrong("the server's encrypt_option agrees with isEncrypted()");
+    }
+    return passed();
+}
+
+@test
+fn optionalEncryptionWorks() -> Result<void, TestFailure> {
+    let config = match (testConfig()) {
+        Some(c) => c,
+        null => { return Ok(); }
+    };
+    return report(Async.run(optionalEncryption(config)));
+}
+
+// ── Values ───────────────────────────────────────────────────────────────────────────────────────────────────
+
+async fn everyType(config: borrow MsSqlConfig) -> Outcome {
+    var db = match (await MsSqlConnection.connect(config)) {
+        Ok(c) => c,
+        Err(e) => { return connectFailed(e); }
+    };
+    let none = MsSqlParams.create();
+    let sql = """
+        SELECT CAST(255 AS tinyint), CAST(-32768 AS smallint), CAST(-2147483648 AS int),
+               CAST(-9223372036854775808 AS bigint), CAST(1 AS bit), CAST(1.5 AS real), CAST(-2.25 AS float),
+               CAST('-1234567890123456789012345678.0123456789' AS decimal(38,10)), CAST(123.45 AS numeric(5,2)),
+               CAST(-922337203685477.5808 AS money), CAST(-214748.3648 AS smallmoney),
+               CAST('2024-02-29' AS date), CAST('23:59:59.1234567' AS time(7)),
+               CAST('2024-05-01T10:30:00.997' AS datetime), CAST('2024-05-01T10:30:00' AS smalldatetime),
+               CAST('0001-01-01T00:00:00.0000001' AS datetime2(7)),
+               CAST('2024-05-01T10:00:00.5+05:30' AS datetimeoffset(7)),
+               CAST('6F9619FF-8B86-D011-B42D-00C04FC964FF' AS uniqueidentifier),
+               CAST('ab' AS char(4)), CAST('café' AS varchar(10)), CAST(N'日本' AS nvarchar(10)),
+               CAST(N'x' AS nchar(2)), CAST('old text' AS text), CAST(N'old ntext' AS ntext),
+               CAST(0xDEADBEEF AS binary(4)), CAST(0x0102 AS varbinary(max)), CAST(0xFF AS image),
+               CAST('<a>1</a>' AS xml), CAST(CAST(42 AS int) AS sql_variant), CAST(NULL AS int),
+               CAST(REPLICATE(CAST(N'z' AS nvarchar(max)), 10000) AS nvarchar(max)), CAST(N'/1/2/' AS hierarchyid)
+        """;
+    let rows = match (await db.query(sql, none)) {
+        Ok(r) => r,
+        Err(e) => { return failed(e, db); }
+    };
+    let expected = [
+        "255", "-32768", "-2147483648", "-9223372036854775808", "1", "1.5", "-2.25",
+        "-1234567890123456789012345678.0123456789", "123.45", "-922337203685477.5808", "-214748.3648",
+        "2024-02-29", "23:59:59.1234567", "2024-05-01T10:30:00.997", "2024-05-01T10:30:00",
+        "0001-01-01T00:00:00.0000001", "2024-05-01T10:00:00.500+05:30", "6F9619FF-8B86-D011-B42D-00C04FC964FF",
+        "ab  ", "café", "日本", "x ", "old text", "old ntext", "0xDEADBEEF", "0x0102", "0xFF", "<a>1</a>", "42",
+    ];
+    for (c in 0..expected.length) {
+        let got = valueText(rows, 0, c);
+        if (got.view() != expected[c]) {
+            var o = wrong("");
+            o.detail.append("column ")!;
+            o.detail.appendNumber(c as u64)!;
+            o.detail.append(": expected ")!;
+            o.detail.append(expected[c])!;
+            o.detail.append(", got ")!;
+            o.detail.append(got.view())!;
+            return o;
+        }
+    }
+    if (!rows.isNull(0, 29)) {
+        return wrong("NULL int");
+    }
+    if (rows.text(0, 30)!.length != 10000) {
+        return wrong("nvarchar(max) of 10000");
+    }
+    if (!(rows.columnType(31) is MsSqlType.Udt) || rows.bytes(0, 31) == null) {
+        return wrong("hierarchyid as bytes");
+    }
+    if (!(rows.columnType(9) is MsSqlType.Money) || !(rows.columnType(16) is MsSqlType.DateTimeOffset)) {
+        return wrong("column types");
+    }
+    if (rows.int64(0, 3) != Some(-9223372036854775807i64 - 1)) {
+        return wrong("bigint min");
+    }
+    return passed();
+}
+
+@test
+fn everyTypeDecodes() -> Result<void, TestFailure> {
+    let config = match (testConfig()) {
+        Some(c) => c,
+        null => { return Ok(); }
+    };
+    return report(Async.run(everyType(config)));
+}
+
+async fn parameterTypes(config: borrow MsSqlConfig) -> Outcome {
+    var db = match (await MsSqlConnection.connect(config)) {
+        Ok(c) => c,
+        Err(e) => { return connectFailed(e); }
+    };
+    var p = MsSqlParams.create();
+    p.int64(-9223372036854775807)!;
+    p.int32(-5)!;
+    p.int16(300)!;
+    p.uint8(200)!;
+    p.bool(true)!;
+    p.float64(0.1)!;
+    p.float32(2.5)!;
+    p.decimalText("-12345678901234567890.123456")!;
+    p.money(-12345)!;
+    p.text("'; DROP TABLE x; -- 😀")!;
+    p.varchar("café")!;
+    p.bytes([0x00u8, 0xFF, 0x10][..])!;
+    p.guid(MsGuid.parse("6F9619FF-8B86-D011-B42D-00C04FC964FF")!)!;
+    p.date(MsDateTime.date(2024, 2, 29))!;
+    p.time(MsDateTime.time(13, 14, 15, 123456700))!;
+    p.dateTime(MsDateTime.of(1999, 12, 31, 23, 59, 59, 999999900))!;
+    p.dateTimeOffset(MsDateTime.of(2024, 5, 1, 1, 0, 0, 0).withOffset(330))!;
+    p.legacyDateTime(MsDateTime.of(2024, 5, 1, 10, 30, 0, 997000000))!;
+    p.nullOf(MsSqlType.NVarChar)!;
+    let sql =
+        "SELECT @p1, @p2, @p3, @p4, @p5, @p6, @p7, @p8, @p9, @p10, @p11, @p12, @p13, @p14, @p15, @p16, @p17, @p18, @p19, SQL_VARIANT_PROPERTY(@p11, 'BaseType'), SQL_VARIANT_PROPERTY(@p17, 'BaseType')";
+    let rows = match (await db.query(sql, p)) {
+        Ok(r) => r,
+        Err(e) => { return failed(e, db); }
+    };
+    let expected = [
+        "-9223372036854775807", "-5", "300", "200", "1", "0.1", "2.5", "-12345678901234567890.123456", "-1.2345",
+        "'; DROP TABLE x; -- 😀", "café", "0x00FF10", "6F9619FF-8B86-D011-B42D-00C04FC964FF", "2024-02-29",
+        "13:14:15.1234567", "1999-12-31T23:59:59.9999999", "2024-05-01T01:00:00+05:30", "2024-05-01T10:30:00.997",
+    ];
+    for (c in 0..expected.length) {
+        let got = valueText(rows, 0, c);
+        if (got.view() != expected[c]) {
+            var o = wrong("");
+            o.detail.append("parameter ")!;
+            o.detail.appendNumber((c + 1) as u64)!;
+            o.detail.append(": expected ")!;
+            o.detail.append(expected[c])!;
+            o.detail.append(", got ")!;
+            o.detail.append(got.view())!;
+            return o;
+        }
+    }
+    if (!rows.isNull(0, 18)) {
+        return wrong("typed NULL");
+    }
+    if (rows.text(0, 19) != Some("varchar") || rows.text(0, 20) != Some("datetimeoffset")) {
+        return wrong("varchar and datetimeoffset sent as themselves");
+    }
+    return passed();
+}
+
+@test
+fn parametersRoundTrip() -> Result<void, TestFailure> {
+    let config = match (testConfig()) {
+        Some(c) => c,
+        null => { return Ok(); }
+    };
+    return report(Async.run(parameterTypes(config)));
+}
+
+async fn largeValues(config: borrow MsSqlConfig) -> Outcome {
+    var db = match (await MsSqlConnection.connect(config)) {
+        Ok(c) => c,
+        Err(e) => { return connectFailed(e); }
+    };
+    var big = String.create();
+    for (i in 0..(5 * 1024 * 1024 / 8)) {
+        big.append("é1234567")!; // 9 bytes of UTF-8, 8 characters
+    }
+    var blob = Vector<u8>.create();
+    for (i in 0..(3 * 1024 * 1024)) {
+        blob.push(truncate<u8>(i * 7))!;
+    }
+    var p = MsSqlParams.create();
+    p.text(big.view())!;
+    p.bytes(blob.view())!;
+    let rows = match (await db.query("SELECT @p1, LEN(@p1), @p2, DATALENGTH(@p2)", p)) {
+        Ok(r) => r,
+        Err(e) => { return failed(e, db); }
+    };
+    if (rows.text(0, 0)! != big.view()) {
+        return wrong("5 MB of text back");
+    }
+    if (rows.int64(0, 1) != Some(5i64 * 1024 * 1024)) {
+        return wrong("LEN of the text");
+    }
+    if (rows.bytes(0, 2)! != blob.view()) {
+        return wrong("3 MB of bytes back");
+    }
+    return passed();
+}
+
+@test
+fn largeValuesRoundTrip() -> Result<void, TestFailure> {
+    let config = match (testConfig()) {
+        Some(c) => c,
+        null => { return Ok(); }
+    };
+    return report(Async.run(largeValues(config)));
+}
+
+// ── Batches, procedures, errors ──────────────────────────────────────────────────────────────────────────────
+
+async fn resultsAndProcedures(config: borrow MsSqlConfig) -> Outcome {
+    var db = match (await MsSqlConnection.connect(config)) {
+        Ok(c) => c,
+        Err(e) => { return connectFailed(e); }
+    };
+    let none = MsSqlParams.create();
+    let all = match (await db.queryAll(
+        "SELECT 1 AS a; PRINT 'between'; SELECT 2 AS b, 3 AS c UNION ALL SELECT 4, 5; SELECT TOP 0 1 AS d",
+        none,
+    )) {
+        Ok(r) => r,
+        Err(e) => { return failed(e, db); }
+    };
+    if (all.count() != 3 || all.result(1).rowCount() != 2 || all.result(1).columnName(1) != "c" ||
+        all.result(2).rowCount() != 0 || all.result(0).int64(0, 0) != Some(1i64)) {
+        return wrong("three result sets in order");
+    }
+    let infos = db.messages();
+    if (infos.length != 1 || infos[0].message.view() != "between") {
+        return wrong("PRINT as a message");
+    }
+    let script = """
+        CREATE PROCEDURE #addUp @a int, @b int, @sum int OUTPUT, @note nvarchar(50) OUTPUT AS
+        BEGIN
+            SELECT @a AS a, @b AS b;
+            SET @sum = @a + @b;
+            SET @note = N'sum of ' + CAST(@a AS nvarchar(10));
+            RETURN 7;
+        END
+        """;
+    match (await db.batch(script)) {
+        Ok(_) => {}
+        Err(e) => { return failed(e, db); }
+    }
+    var p = MsSqlParams.create();
+    p.name("@a");
+    p.int32(40)!;
+    p.name("@b");
+    p.int32(2)!;
+    p.name("@sum");
+    p.output();
+    p.nullOf(MsSqlType.Int)!;
+    p.name("@note");
+    p.output();
+    p.nullOf(MsSqlType.NVarChar)!;
+    let called = match (await db.callProcedure("#addUp", p)) {
+        Ok(r) => r,
+        Err(e) => { return failed(e, db); }
+    };
+    if (called.returnStatus() != Some(7i32)) {
+        return wrong("RETURN 7");
+    }
+    let outputs = called.outputs();
+    match (outputs.columnIndex("sum")) {
+        Some(i) => {
+            if (outputs.int64(0, i) != Some(42i64)) {
+                return wrong("@sum is 42");
+            }
+        }
+        null => { return wrong("an output named sum"); }
+    }
+    if (outputs.text(0, outputs.columnIndex("note")!) != Some("sum of 40")) {
+        return wrong("@note");
+    }
+    if (called.count() != 1 || called.result(0).int64(0, 1) != Some(2i64)) {
+        return wrong("the procedure's result set");
+    }
+    // sp_executesql with an output parameter.
+    var q = MsSqlParams.create();
+    q.int32(5)!;
+    q.name("@out");
+    q.output();
+    q.nullOf(MsSqlType.BigInt)!;
+    let executed = match (await db.queryAll("SET @out = CAST(@p1 AS bigint) * 1000000000", q)) {
+        Ok(r) => r,
+        Err(e) => { return failed(e, db); }
+    };
+    if (executed.outputs().int64(0, 0) != Some(5000000000i64)) {
+        return wrong("sp_executesql output");
+    }
+    return passed();
+}
+
+@test
+fn resultsAndProceduresWork() -> Result<void, TestFailure> {
+    let config = match (testConfig()) {
+        Some(c) => c,
+        null => { return Ok(); }
+    };
+    return report(Async.run(resultsAndProcedures(config)));
+}
+
+async fn errors(config: borrow MsSqlConfig) -> Outcome {
+    var db = match (await MsSqlConnection.connect(config)) {
+        Ok(c) => c,
+        Err(e) => { return connectFailed(e); }
+    };
+    let none = MsSqlParams.create();
+    match (await db.execute("RAISERROR('boom %d', 16, 3, 42)", none)) {
+        Ok(_) => { return wrong("RAISERROR should fail"); }
+        Err(MsSqlError.Server) => {}
+        Err(e) => { return failed(e, db); }
+    }
+    let first = db.lastError()!;
+    if (first.number != 50000 || first.state != 3 || first.severity != 16 || first.message.view() != "boom 42") {
+        return wrong("the error's fields");
+    }
+    if (!db.isReady()) {
+        return wrong("usable after a server error");
+    }
+    match (await db.batch("CREATE TABLE #u (id int PRIMARY KEY); INSERT #u VALUES (1)")) {
+        Ok(_) => {}
+        Err(e) => { return failed(e, db); }
+    }
+    var p = MsSqlParams.create();
+    p.int32(1)!;
+    match (await db.execute("INSERT #u VALUES (@p1)", p)) {
+        Ok(_) => { return wrong("a duplicate key should fail"); }
+        Err(MsSqlError.Server) => {
+            if (db.lastError()!.number != 2627) {
+                return wrong("2627, a primary key violation");
+            }
+        }
+        Err(e) => { return failed(e, db); }
+    }
+    // An error inside a SELECT's rows: the response is read to its end.
+    match (await db.query("SELECT 1/0 AS x UNION ALL SELECT 2", none)) {
+        Ok(_) => { return wrong("divide by zero should fail"); }
+        Err(MsSqlError.Server) => {}
+        Err(e) => { return failed(e, db); }
+    }
+    match (await db.query("SELECT 'still here'", none)) {
+        Ok(r) => {
+            if (r.text(0, 0) != Some("still here")) {
+                return wrong("the next query's answer");
+            }
+        }
+        Err(e) => { return failed(e, db); }
+    }
+    return passed();
+}
+
+@test
+fn errorsLeaveTheConnectionUsable() -> Result<void, TestFailure> {
+    let config = match (testConfig()) {
+        Some(c) => c,
+        null => { return Ok(); }
+    };
+    return report(Async.run(errors(config)));
+}
+
+async fn transactions(config: borrow MsSqlConfig) -> Outcome {
+    var db = match (await MsSqlConnection.connect(config)) {
+        Ok(c) => c,
+        Err(e) => { return connectFailed(e); }
+    };
+    let none = MsSqlParams.create();
+    match (await db.batch("CREATE TABLE #t (id int)")) {
+        Ok(_) => {}
+        Err(e) => { return failed(e, db); }
+    }
+    match (await db.begin()) {
+        Ok() => {}
+        Err(e) => { return failed(e, db); }
+    }
+    if (!db.inTransaction()) {
+        return wrong("in a transaction after begin");
+    }
+    match (await db.execute("INSERT #t VALUES (1), (2), (3)", none)) {
+        Ok(n) => {
+            if (n != 3) {
+                return wrong("three rows inserted");
+            }
+        }
+        Err(e) => { return failed(e, db); }
+    }
+    match (await db.rollback()) {
+        Ok() => {}
+        Err(e) => { return failed(e, db); }
+    }
+    if (db.inTransaction()) {
+        return wrong("no transaction after rollback");
+    }
+    match (await db.beginWith(MsIsolation.Serializable)) {
+        Ok() => {}
+        Err(e) => { return failed(e, db); }
+    }
+    var p = MsSqlParams.create();
+    p.int32(9)!;
+    match (await db.execute("INSERT #t VALUES (@p1); UPDATE #t SET id = id + 1", p)) {
+        Ok(n) => {
+            if (n != 2) {
+                return wrong("an insert and an update, one row each");
+            }
+        }
+        Err(e) => { return failed(e, db); }
+    }
+    match (await db.commit()) {
+        Ok() => {}
+        Err(e) => { return failed(e, db); }
+    }
+    let rows = match (await db.query("SELECT COUNT(*), MAX(id) FROM #t", none)) {
+        Ok(r) => r,
+        Err(e) => { return failed(e, db); }
+    };
+    if (rows.int64(0, 0) != Some(1i64) || rows.int64(0, 1) != Some(10i64)) {
+        return wrong("the committed row only");
+    }
+    match (await db.commit()) {
+        Err(MsSqlError.WrongState) => {}
+        _ => { return wrong("commit without a transaction"); }
+    }
+    return passed();
+}
+
+@test
+fn transactionsCommitAndRollBack() -> Result<void, TestFailure> {
+    let config = match (testConfig()) {
+        Some(c) => c,
+        null => { return Ok(); }
+    };
+    return report(Async.run(transactions(config)));
+}
+
+// ── Streaming, timeouts, the pool ────────────────────────────────────────────────────────────────────────────
+
+async fn streaming(config: borrow MsSqlConfig) -> Outcome {
+    var db = match (await MsSqlConnection.connect(config)) {
+        Ok(c) => c,
+        Err(e) => { return connectFailed(e); }
+    };
+    let none = MsSqlParams.create();
+    let many = """
+        WITH n AS (SELECT TOP (200000) ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) AS i
+                   FROM sys.all_objects a CROSS JOIN sys.all_objects b)
+        SELECT i, CONCAT(N'row ', i) AS label FROM n ORDER BY i;
+        SELECT N'second' AS s
+        """;
+    match (await db.start(many, none)) {
+        Ok(true) => {}
+        Ok(false) => { return wrong("a first result"); }
+        Err(e) => { return failed(e, db); }
+    }
+    var batch = MsSqlRows.create();
+    var seen: i64 = 0;
+    loop {
+        match (await db.fetch(mut batch, 5000)) {
+            Ok(true) => {}
+            Ok(false) => { break; }
+            Err(e) => { return failed(e, db); }
+        }
+        for (r in 0..batch.rowCount()) {
+            seen += 1;
+            if (batch.int64(r, 0) != Some(seen)) {
+                return wrong("rows in order");
+            }
+        }
+    }
+    if (seen != 200000) {
+        return wrong("200000 rows");
+    }
+    match (await db.nextResult()) {
+        Ok(true) => {}
+        _ => { return wrong("the second result"); }
+    }
+    match (await db.fetch(mut batch, 10)) {
+        Ok(true) => {
+            if (batch.text(0, 0) != Some("second")) {
+                return wrong("the second result's row");
+            }
+        }
+        _ => { return wrong("the second result's row"); }
+    }
+    match (await db.finish()) {
+        Ok(_) => {}
+        Err(e) => { return failed(e, db); }
+    }
+    // Stopping early.
+    match (await db.start(many, none)) {
+        Ok(_) => {}
+        Err(e) => { return failed(e, db); }
+    }
+    match (await db.fetch(mut batch, 100)) {
+        Ok(true) => {}
+        _ => { return wrong("a first batch"); }
+    }
+    match (await db.cancel()) {
+        Ok() => {}
+        Err(e) => { return failed(e, db); }
+    }
+    match (await db.query("SELECT 'after cancel'", none)) {
+        Ok(r) => {
+            if (r.text(0, 0) != Some("after cancel")) {
+                return wrong("a query after cancel");
+            }
+        }
+        Err(e) => { return failed(e, db); }
+    }
+    return passed();
+}
+
+@test
+fn streamingFetchesInBatches() -> Result<void, TestFailure> {
+    let config = match (testConfig()) {
+        Some(c) => c,
+        null => { return Ok(); }
+    };
+    return report(Async.run(streaming(config)));
+}
+
+async fn timeouts(config: borrow MsSqlConfig) -> Outcome {
+    var db = match (await MsSqlConnection.connect(config)) {
+        Ok(c) => c,
+        Err(e) => { return connectFailed(e); }
+    };
+    let none = MsSqlParams.create();
+    db.setCommandTimeout(300);
+    let started = Timer.now();
+    match (await db.execute("WAITFOR DELAY '00:00:05'", none)) {
+        Err(MsSqlError.TimedOut) => {}
+        Ok(_) => { return wrong("WAITFOR should time out"); }
+        Err(e) => { return failed(e, db); }
+    }
+    if (Timer.now() - started > 4000) {
+        return wrong("the timeout ended the wait");
+    }
+    if (!db.isReady()) {
+        return wrong("usable after a timeout (the attention was answered)");
+    }
+    db.setCommandTimeout(30000);
+    match (await db.query("SELECT 'after timeout'", none)) {
+        Ok(r) => {
+            if (r.text(0, 0) != Some("after timeout")) {
+                return wrong("the answer after a timeout");
+            }
+        }
+        Err(e) => { return failed(e, db); }
+    }
+    return passed();
+}
+
+@test
+fn timeoutsCancelOnTheServer() -> Result<void, TestFailure> {
+    let config = match (testConfig()) {
+        Some(c) => c,
+        null => { return Ok(); }
+    };
+    return report(Async.run(timeouts(config)));
+}
+
+async fn pooled(pool: borrow MsSqlPool) -> Outcome {
+    let none = MsSqlParams.create();
+    var spid: i64 = 0;
+    {
+        var lease = match (await pool.acquire()) {
+            Ok(l) => l,
+            Err(e) => { return connectFailed(e); }
+        };
+        match (await lease.connection().batch("CREATE TABLE #leftover (id int); SET LOCK_TIMEOUT 1234")) {
+            Ok(_) => {}
+            Err(e) => { return failed(e, lease.connection()); }
+        }
+        match (await lease.connection().query("SELECT @@SPID", none)) {
+            Ok(r) => { spid = r.int64(0, 0)!; }
+            Err(e) => { return failed(e, lease.connection()); }
+        }
+    }
+    var again = match (await pool.acquire()) {
+        Ok(l) => l,
+        Err(e) => { return connectFailed(e); }
+    };
+    match (await again.connection().query("SELECT @@SPID, OBJECT_ID('tempdb..#leftover'), @@LOCK_TIMEOUT", none)) {
+        Ok(r) => {
+            if (r.int64(0, 0) != Some(spid)) {
+                return wrong("the same session again");
+            }
+            if (!r.isNull(0, 1) || r.int64(0, 2) != Some(-1i64)) {
+                return wrong("the session reset between leases");
+            }
+        }
+        Err(e) => { return failed(e, again.connection()); }
+    }
+    return passed();
+}
+
+@test
+fn poolReusesAndResets() -> Result<void, TestFailure> {
+    let config = match (testConfig()) {
+        Some(c) => c,
+        null => { return Ok(); }
+    };
+    let pool = MsSqlPool.create(config, 2)!;
+    return report(Async.run(pooled(pool)));
+}
+
+async fn json(config: borrow MsSqlConfig) -> Outcome {
+    var db = match (await MsSqlConnection.connect(config)) {
+        Ok(c) => c,
+        Err(e) => { return connectFailed(e); }
+    };
+    let none = MsSqlParams.create();
+    var text = String.create();
+    match (await db.queryJson(
+        "SELECT TOP (3000) object_id AS id, name FROM sys.all_objects ORDER BY object_id FOR JSON PATH",
+        none,
+        mut text,
+    )) {
+        Ok() => {}
+        Err(e) => { return failed(e, db); }
+    }
+    // Longer than one 2033-character row, and whole.
+    if (text.length < 10000 || !text.view().startsWith("[{") || !text.view().endsWith("}]")) {
+        return wrong("FOR JSON joined");
+    }
+    return passed();
+}
+
+@test
+fn forJsonIsJoined() -> Result<void, TestFailure> {
+    let config = match (testConfig()) {
+        Some(c) => c,
+        null => { return Ok(); }
+    };
+    return report(Async.run(json(config)));
+}
+
+// ── Backups (opt-in: they write a file on the server) ────────────────────────────────────────────────────────
+
+async fn backupAndRestore(config: borrow MsSqlConfig, path: StringView) -> Outcome {
+    var db = match (await MsSqlConnection.connect(config)) {
+        Ok(c) => c,
+        Err(e) => { return connectFailed(e); }
+    };
+    let none = MsSqlParams.create();
+    let name = match (await db.query("SELECT DB_NAME()", none)) {
+        Ok(r) => r,
+        Err(e) => { return failed(e, db); }
+    };
+    var database = String.create();
+    database.append(name.text(0, 0)!)!;
+    match (await db.backupDatabase(database.view(), path, false, true)) {
+        Ok() => {}
+        Err(e) => { return failed(e, db); }
+    }
+    // Restoring needs the database to itself: move this session away first.
+    match (await db.batch("USE master")) {
+        Ok(_) => {}
+        Err(e) => { return failed(e, db); }
+    }
+    match (await db.restoreDatabase(database.view(), path)) {
+        Ok() => {}
+        Err(e) => { return failed(e, db); }
+    }
+    return passed();
+}
+
+/// MSSQL_TEST_BACKUP_PATH: a file path on the server's disk, e.g. /var/opt/mssql/data/sqlclient_test.bak. The test
+/// backs the test database up there and restores it over itself.
+@test
+fn backupsAndRestores() -> Result<void, TestFailure> {
+    let config = match (testConfig()) {
+        Some(c) => c,
+        null => { return Ok(); }
+    };
+    let path = match (Environment.variable("MSSQL_TEST_BACKUP_PATH")) {
+        Some(p) => p,
+        null => { return Ok(); }
+    };
+    return report(Async.run(backupAndRestore(config, path)));
+}

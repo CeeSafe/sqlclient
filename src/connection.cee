@@ -1,0 +1,1597 @@
+import tls.TlsConfig;
+import tls.TlsEngine;
+import tls.TlsError;
+
+// Packet types (MS-TDS 2.2.3.1.1).
+const PKT_SQL_BATCH: u8 = 0x01;
+const PKT_RPC: u8 = 0x03;
+const PKT_ATTENTION: u8 = 0x06;
+const PKT_LOGIN7: u8 = 0x10;
+const PKT_SSPI: u8 = 0x11;
+const PKT_PRELOGIN: u8 = 0x12;
+
+// Packet status bits.
+const STATUS_EOM: u8 = 0x01;
+const STATUS_RESET_CONNECTION: u8 = 0x08;
+
+// DONE status bits (2.2.7.6).
+const DONE_MORE: u16 = 0x0001;
+const DONE_COUNT: u16 = 0x0010;
+const DONE_ATTN: u16 = 0x0020;
+/// DONE's CurCmd for a SELECT.
+const CMD_SELECT: u16 = 0xC1;
+
+/// Packets of at most this size until the server agrees on another (the login itself is sent so).
+const LOGIN_PACKET_SIZE: usize = 4096;
+/// How much is read from the socket at a time, and the input buffer's starting size.
+const READ_CHUNK: usize = 32 * 1024;
+/// Packets are gathered up to this size before a write.
+const WRITE_BATCH: usize = 64 * 1024;
+/// How long recovering from a timeout (the attention and its answer) may take.
+const ATTENTION_TIMEOUT_MS: u64 = 5000;
+/// At most this many INFO messages are kept per operation (a loop of PRINTs must not exhaust memory).
+const MAX_INFOS: usize = 1000;
+const MAX_ERRORS: usize = 100;
+
+// What `step` stops for.
+const EV_COLUMNS: u8 = 1;
+const EV_ROW: u8 = 2;
+const EV_DONE: u8 = 3;
+const EV_END: u8 = 4;
+/// `parseToken`: the token runs past the bytes received (`needBytes` from the token's start).
+const NEED: u8 = 255;
+
+// A streamed query's state.
+const S_IDLE: u8 = 0;
+/// In a result: `fetch` gives its rows.
+const S_ROWS: u8 = 1;
+/// A result has ended; whether another follows is not known yet.
+const S_BETWEEN: u8 = 2;
+/// The next result's columns have been read; `nextResult` enters it.
+const S_NEXT: u8 = 3;
+
+// What `perform` does, under the command timeout.
+const OP_COLLECT: u8 = 1;
+const OP_START: u8 = 2;
+const OP_FETCH: u8 = 3;
+const OP_NEXT: u8 = 4;
+const OP_FINISH: u8 = 5;
+
+// Which results `collect` keeps.
+const KEEP_NONE: u8 = 0;
+const KEEP_FIRST: u8 = 1;
+const KEEP_ALL: u8 = 2;
+
+/// A DONE, DONEPROC or DONEINPROC token.
+struct DoneInfo {
+    token: u8;
+    status: u16;
+    command: u16;
+    count: u64;
+}
+
+/// The server's version, from its LOGINACK: 16 is SQL Server 2022, 15 2019, 14 2017.
+public struct MsServerVersion {
+    public major: u8;
+    public minor: u8;
+    public build: u16;
+}
+
+/// A transaction's isolation level.
+public enum MsIsolation {
+    ReadUncommitted,
+    ReadCommitted,
+    RepeatableRead,
+    Serializable,
+    Snapshot,
+}
+
+/// Every result of a batch or a stored procedure call: its result sets, output parameters and return status.
+@noncopy
+public struct MsSqlResults {
+    private sets: Vector<MsSqlRows>;
+    private out: MsSqlRows;
+    private status: i32?;
+    private affected: u64;
+
+    /// No results yet.
+    public fn create() -> MsSqlResults => MsSqlResults {
+        sets: Vector<MsSqlRows>.create(),
+        out: MsSqlRows.create(),
+        status: null,
+        affected: 0,
+    };
+
+    /// How many result sets came back.
+    public fn count(borrow this) -> usize => this.sets.length;
+
+    /// Result set `i` (from 0); panics when there is none.
+    public fn result(borrow this, i: usize) -> borrow MsSqlRows => borrow this.sets[i];
+
+    /// The output parameters as one row, a column per parameter, named without its `@`:
+    /// `outputs().int64(0, outputs().columnIndex("total")!)`.
+    public fn outputs(borrow this) -> borrow MsSqlRows => borrow this.out;
+
+    /// A stored procedure's `RETURN` value, or null.
+    public fn returnStatus(borrow this) -> i32? => this.status;
+
+    /// The rows the batch's INSERT, UPDATE, DELETE and MERGE statements affected, in all.
+    public fn affectedRows(borrow this) -> u64 => this.affected;
+}
+
+/// One session with SQL Server over TDS 7.4 (or TDS 8.0 with `Encrypt=strict`).
+///
+/// - **Queries.** `query` gives the first result set's rows, `queryAll` every result set, `execute` the count of
+///   rows changed; `callProcedure` calls a stored procedure with output parameters and its return status. With
+///   parameters a statement runs through `sp_executesql`, its values typed and apart from the SQL; without, as a
+///   plain batch (so a script with `GO`-free batches of DDL works, and a temporary table it makes stays for later
+///   statements).
+/// - **Streaming.** `start`, then `fetch` up to n rows at a time, `nextResult` to move on, `finish` (or `cancel`)
+///   at the end: for results too large to hold at once.
+/// - **Errors.** A failed statement gives `MsSqlError.Server`; `errors()` has every message the server sent,
+///   `lastError()` the first, and the connection is usable again. `PRINT` and other informational messages are in
+///   `messages()`. Both are cleared when the next operation starts.
+/// - **Timeouts.** Every operation is bounded by the command timeout (30 s by default, `Command Timeout`). When it
+///   runs out the server is told to stop (an attention) and its answer drained, so the connection stays usable and
+///   the operation fails with `TimedOut`.
+/// - **One operation at a time.** Every operation takes `borrow mut this`. If one is cancelled from outside, or
+///   fails partway, the connection reports `Broken` from then on: drop it, or try `recover()`.
+@noncopy
+public struct MsSqlConnection {
+    private tcp: AsyncTcpStream;
+    private tls: TlsEngine?;
+    /// Raw bytes from the socket, before decryption.
+    private net: Vector<u8>;
+    /// Ciphertext to send.
+    private cipher: Vector<u8>;
+    /// The stream after TLS: `[inStart, inEnd)` is not yet taken apart into packets.
+    private input: Vector<u8>;
+    private inStart: usize;
+    private inEnd: usize;
+    /// The current message's packet payloads, joined: tokens from `payStart` on are not read yet.
+    private payload: Vector<u8>;
+    private payStart: usize;
+    /// The packet with the end-of-message bit has arrived.
+    private messageDone: bool;
+    /// The response's final DONE has been read.
+    private ended: bool;
+    private needBytes: usize;
+    /// The message being built, without packet headers.
+    private output: Vector<u8>;
+    /// Packets being sent.
+    private wire: Vector<u8>;
+    private packetSize: usize;
+    /// An exchange has started and its response is not finished.
+    private busy: bool;
+    /// A request is being written: a timeout now leaves half a packet on the wire.
+    private sending: bool;
+    private stream: u8;
+    /// The open transaction's descriptor, or 0.
+    private descriptor: u64;
+    private session: SessionText;
+    private meta: MsMeta;
+    private lastDone: DoneInfo;
+    private errorList: Vector<MsSqlMessage>;
+    private infoList: Vector<MsSqlMessage>;
+    private status: i32?;
+    private outputs: MsSqlRows;
+    /// A small token's body, copied out of the payload to be handled.
+    private tokenBody: Vector<u8>;
+    private loginAcked: bool;
+    private sspi: Vector<u8>;
+    private version: MsServerVersion;
+    private databaseName: String;
+    private routeHost: String;
+    private routePort: u16;
+    private resetPending: bool;
+    private commandMillis: u64;
+    private spid: u16;
+    /// An error of severity 20 or more: the server ends the session.
+    private fatal: bool;
+    private streamCount: u64;
+
+    // ---- Connecting ----
+
+    /// Connects, agrees on encryption, and logs in, within the connect timeout. Every address the host resolves to
+    /// is tried in order. A named instance without a port is looked up through SQL Server Browser; a redirect from
+    /// the server (Azure SQL's gateway) is followed once.
+    public async fn connect(config: borrow MsSqlConfig) -> Result<MsSqlConnection, MsSqlError> {
+        let ms = config.connectTimeout();
+        if (ms == 0) {
+            return await MsSqlConnection.open(config);
+        }
+        return await Async.timeout(ms, MsSqlError.TimedOut, async () => await MsSqlConnection.open(config));
+    }
+
+    async fn open(config: borrow MsSqlConfig) -> Result<MsSqlConnection, MsSqlError> {
+        var port = config.port();
+        if (port == 0) {
+            port = await browseInstancePort(config.host(), config.instance())?;
+        }
+        var connection = await MsSqlConnection.openAt(config, config.host(), port)?;
+        if (connection.routeHost.length == 0) {
+            return Ok(connection);
+        }
+        // Routed: log in again where the server says.
+        let host = replace(mut connection.routeHost, String.create());
+        let routedPort = connection.routePort;
+        var routed = await MsSqlConnection.openAt(config, host.view(), routedPort)?;
+        routed.routeHost.clear();
+        return Ok(routed);
+    }
+
+    async fn openAt(config: borrow MsSqlConfig, host: StringView, port: u16) -> Result<MsSqlConnection, MsSqlError> {
+        let addresses = match (await AsyncDns.resolve(host, port)) {
+            Ok(a) => a,
+            Err(e) => { return Err(MsSqlError.Io(e)); }
+        };
+        var failure = MsSqlError.Closed;
+        for (address in addresses.view()) {
+            match (await AsyncTcpStream.connectTo(address)) {
+                Ok(tcp) => {
+                    match (tcp.setNoDelay(true)) {
+                        Ok() => {}
+                        Err(_) => {}
+                    }
+                    var connection = MsSqlConnection.over(tcp, config.commandTimeout())?;
+                    await connection.login(config, host)?;
+                    return Ok(connection);
+                }
+                Err(e) => { failure = MsSqlError.Io(e); }
+            }
+        }
+        return Err(failure);
+    }
+
+    fn over(tcp: AsyncTcpStream, commandMillis: u64) -> Result<MsSqlConnection, MsSqlError> {
+        var input = Vector<u8>.create();
+        allocated(input.resize(READ_CHUNK, 0))?;
+        var net = Vector<u8>.create();
+        allocated(net.resize(READ_CHUNK, 0))?;
+        return Ok(MsSqlConnection {
+            tcp: tcp,
+            tls: null,
+            net: net,
+            cipher: Vector<u8>.create(),
+            input: input,
+            inStart: 0,
+            inEnd: 0,
+            payload: Vector<u8>.create(),
+            payStart: 0,
+            messageDone: false,
+            ended: false,
+            needBytes: 0,
+            output: Vector<u8>.create(),
+            wire: Vector<u8>.create(),
+            packetSize: LOGIN_PACKET_SIZE,
+            busy: true, // until the login completes
+            sending: false,
+            stream: S_IDLE,
+            descriptor: 0,
+            // SQL_Latin1_General_CP1_CI_AS until the server says which collation the database has.
+            session: SessionText { collation: [0x09u8, 0x04, 0xD0, 0x00, 0x34], codePage: 1252 },
+            meta: MsMeta.create(),
+            lastDone: DoneInfo { token: 0, status: 0, command: 0, count: 0 },
+            errorList: Vector<MsSqlMessage>.create(),
+            infoList: Vector<MsSqlMessage>.create(),
+            status: null,
+            outputs: MsSqlRows.create(),
+            tokenBody: Vector<u8>.create(),
+            loginAcked: false,
+            sspi: Vector<u8>.create(),
+            version: MsServerVersion { major: 0, minor: 0, build: 0 },
+            databaseName: String.create(),
+            routeHost: String.create(),
+            routePort: 0,
+            resetPending: false,
+            commandMillis: commandMillis,
+            spid: 0,
+            fatal: false,
+            streamCount: 0,
+        });
+    }
+
+    /// PRELOGIN, TLS, LOGIN7 and its answer.
+    async fn login(borrow mut this, config: borrow MsSqlConfig, host: StringView) -> Result<void, MsSqlError> {
+        let tlsConfig = config.tls() ?? { return Err(MsSqlError.Config); };
+        let certificateHost = config.certificateHost();
+        // 0: no TLS; 1: TLS for the login only; 2: TLS throughout.
+        var level: u8 = 2;
+        match (config.encrypt()) {
+            MsEncrypt.Strict => {
+                var engine = tlsEngine(tlsConfig, certificateHost)?;
+                await this.handshakeRaw(mut engine)?;
+                this.tls = engine;
+                buildPreLoginOrFail(ENCRYPT_ON, config.instance(), mut this.output)?;
+                await this.sendMessage(PKT_PRELOGIN)?;
+                await this.readWholeMessage()?;
+                parsePreLogin(this.payload.view())?;
+            }
+            _ => {
+                let mandatory = config.encrypt() is MsEncrypt.Mandatory;
+                buildPreLoginOrFail(if (mandatory) ENCRYPT_ON else ENCRYPT_OFF, config.instance(), mut this.output)?;
+                await this.sendMessage(PKT_PRELOGIN)?;
+                await this.readWholeMessage()?;
+                let answer = parsePreLogin(this.payload.view())?;
+                let server = answer.encryption;
+                if (server == ENCRYPT_NOT_SUP) {
+                    if (mandatory) {
+                        return Err(MsSqlError.EncryptionRefused);
+                    }
+                    level = 0;
+                } else if (server == ENCRYPT_OFF && !mandatory) {
+                    level = 1;
+                }
+                if (level > 0) {
+                    var engine = tlsEngine(tlsConfig, certificateHost)?;
+                    await this.handshakeWrapped(mut engine)?;
+                    this.tls = engine;
+                }
+            }
+        }
+        // LOGIN7.
+        let windows = config.usesWindowsLogin();
+        var negotiate = Vector<u8>.create();
+        if (windows) {
+            if (config.user().length == 0 || config.password().length == 0) {
+                return Err(MsSqlError.UnsupportedAuthentication);
+            }
+            allocated(ntlmNegotiate(mut negotiate))?;
+        }
+        var serverName = String.create();
+        allocated(serverName.append(host))?;
+        if (config.instance().length > 0) {
+            allocated(serverName.append("\\"))?;
+            allocated(serverName.append(config.instance()))?;
+        }
+        let fields = LoginFields {
+            hostName: config.workstation(),
+            userName: if (windows) "" else config.user(),
+            password: if (windows) "" else config.password(),
+            appName: config.applicationName(),
+            serverName: serverName.view(),
+            language: config.language(),
+            database: config.database(),
+            sspi: negotiate.view(),
+            packetSize: config.packetSize(),
+            readOnlyIntent: config.readOnlyIntent(),
+        };
+        buildLogin7(fields, mut this.output)?;
+        await this.sendMessage(PKT_LOGIN7)?;
+        if (level == 1) {
+            this.tls = null; // the login was the only encrypted message
+        }
+        this.beginResponse();
+        await this.drainResponse()?;
+        if (!this.loginAcked && this.sspi.length > 0) {
+            // NTLM: answer the server's challenge.
+            var challenge = replace(mut this.sspi, Vector<u8>.create());
+            ntlmAuthenticate(
+                challenge.view(),
+                config.user(),
+                config.domain(),
+                config.password(),
+                config.workstation(),
+                mut this.output,
+            )?;
+            challenge.clear();
+            await this.sendMessage(PKT_SSPI)?;
+            this.beginResponse();
+            await this.drainResponse()?;
+        }
+        if (!this.loginAcked) {
+            return Err(MsSqlError.Login);
+        }
+        this.busy = false;
+        return Ok();
+    }
+
+    // ---- TLS ----
+
+    /// TDS 7.x: the handshake's records travel in PRELOGIN packets.
+    async fn handshakeWrapped(borrow mut this, engine: borrow mut TlsEngine) -> Result<void, MsSqlError> {
+        loop {
+            let done = tlsResult(engine.handshake())?;
+            if (engine.pendingOutput() > 0) {
+                this.output.clear();
+                tlsResult(engine.takeAllOutput(mut this.output))?;
+                await this.sendMessage(PKT_PRELOGIN)?;
+            }
+            if (done) {
+                return Ok();
+            }
+            await this.readWholeMessage()?;
+            tlsResult(engine.feed(this.payload.view()))?;
+            this.payload.clear();
+            this.payStart = 0;
+        }
+    }
+
+    /// TDS 8.0: TLS straight over TCP, before anything else.
+    async fn handshakeRaw(borrow mut this, engine: borrow mut TlsEngine) -> Result<void, MsSqlError> {
+        loop {
+            let done = tlsResult(engine.handshake())?;
+            if (engine.pendingOutput() > 0) {
+                this.cipher.clear();
+                tlsResult(engine.takeAllOutput(mut this.cipher))?;
+                ioResult(await this.tcp.write(this.cipher.view()))?;
+            }
+            if (done) {
+                return Ok();
+            }
+            let room = this.net.viewMut();
+            let n = ioResult(await this.tcp.read(room))?;
+            if (n == 0) {
+                return Err(MsSqlError.Closed);
+            }
+            let got = this.net.view();
+            tlsResult(engine.feed(got[0..n]))?;
+        }
+    }
+
+    // ---- Bytes in and out ----
+
+    /// Reads more of the stream into `input`, after making room for `need` unread bytes in all.
+    async fn fillInput(borrow mut this, need: usize) -> Result<void, MsSqlError> {
+        if (this.inStart > 0 && (this.inStart == this.inEnd || this.inStart + need > this.input.length ||
+            this.inEnd == this.input.length)) {
+            this.input.copyWithin(this.inStart, 0, this.inEnd - this.inStart);
+            this.inEnd -= this.inStart;
+            this.inStart = 0;
+        }
+        if (need > this.input.length) {
+            allocated(this.input.resize(need, 0))?;
+        } else if (this.inEnd == this.input.length) {
+            allocated(this.input.resize(this.input.length * 2, 0))?;
+        }
+        let at = this.inEnd;
+        let room = this.input.viewMut();
+        var n: usize = 0;
+        var secure = false;
+        match (borrow mut this.tls) {
+            null => { n = ioResult(await this.tcp.read(mut room[at..]))?; }
+            Some(engine) => {
+                secure = true;
+                loop {
+                    match (tlsResult(engine.read(mut room[at..]))?) {
+                        Some(got) => {
+                            n = got;
+                            break;
+                        }
+                        null => {
+                            let raw = this.net.viewMut();
+                            let got = ioResult(await this.tcp.read(raw))?;
+                            if (got == 0) {
+                                return Err(MsSqlError.Closed);
+                            }
+                            let fed = this.net.view();
+                            tlsResult(engine.feed(fed[0..got]))?;
+                        }
+                    }
+                }
+            }
+        }
+        if (n == 0) {
+            return Err(MsSqlError.Closed);
+        }
+        this.inEnd += n;
+        if (secure) {
+            await this.flushEngine()?; // a TLS 1.3 key update may want an answer
+        }
+        return Ok();
+    }
+
+    /// Sends what the TLS engine has queued by itself.
+    async fn flushEngine(borrow mut this) -> Result<void, MsSqlError> {
+        var pending = false;
+        match (borrow mut this.tls) {
+            Some(engine) => {
+                if (engine.pendingOutput() > 0) {
+                    this.cipher.clear();
+                    tlsResult(engine.takeAllOutput(mut this.cipher))?;
+                    pending = true;
+                }
+            }
+            null => {}
+        }
+        if (pending) {
+            ioResult(await this.tcp.write(this.cipher.view()))?;
+        }
+        return Ok();
+    }
+
+    /// Writes the gathered packets, through TLS when it is on.
+    async fn flushWire(borrow mut this) -> Result<void, MsSqlError> {
+        var secure = false;
+        match (borrow mut this.tls) {
+            Some(engine) => {
+                tlsResult(engine.write(this.wire.view()))?;
+                this.cipher.clear();
+                tlsResult(engine.takeAllOutput(mut this.cipher))?;
+                secure = true;
+            }
+            null => {}
+        }
+        if (secure) {
+            ioResult(await this.tcp.write(this.cipher.view()))?;
+        } else {
+            ioResult(await this.tcp.write(this.wire.view()))?;
+        }
+        this.wire.clear();
+        return Ok();
+    }
+
+    /// Sends `output` as a message of packets of type `kind`.
+    async fn sendMessage(borrow mut this, kind: u8) -> Result<void, MsSqlError> {
+        this.sending = true;
+        let body = this.packetSize - 8;
+        let total = this.output.length;
+        var at: usize = 0;
+        var id: u8 = 1;
+        this.wire.clear();
+        loop {
+            let n = if (total - at > body) body else total - at;
+            let last = at + n >= total;
+            var status: u8 = if (last) STATUS_EOM else 0u8;
+            if (at == 0 && this.resetPending && (kind == PKT_SQL_BATCH || kind == PKT_RPC)) {
+                status = status | STATUS_RESET_CONNECTION;
+                this.resetPending = false;
+            }
+            allocated(this.wire.push(kind))?;
+            allocated(this.wire.push(status))?;
+            allocated(this.wire.pushBE(truncate<u16>(n + 8)))?;
+            allocated(this.wire.pushBE(0u16))?; // SPID
+            allocated(this.wire.push(id))?;
+            allocated(this.wire.push(0))?; // window
+            allocated(this.wire.extend(this.output[at..at + n]))?;
+            id = id.wrappingAdd(1);
+            at += n;
+            // SQL Server reads one TDS packet per TLS record: each packet is encrypted on its own.
+            var queued: usize = this.wire.length;
+            match (borrow mut this.tls) {
+                Some(engine) => {
+                    tlsResult(engine.write(this.wire.view()))?;
+                    this.wire.clear();
+                    queued = engine.pendingOutput();
+                }
+                null => {}
+            }
+            if (last || queued >= WRITE_BATCH) {
+                await this.flushWire()?;
+            }
+            if (last) {
+                break;
+            }
+        }
+        this.output.clear();
+        this.sending = false;
+        return Ok();
+    }
+
+    /// Reads the next packet and appends its payload; gives its type.
+    async fn readPacket(borrow mut this) -> Result<u8, MsSqlError> {
+        while (this.inEnd - this.inStart < 8) {
+            await this.fillInput(8)?;
+        }
+        let length = this.input.view().readBE<u16>(this.inStart + 2) as usize;
+        if (length < 8) {
+            return Err(MsSqlError.Protocol);
+        }
+        while (this.inEnd - this.inStart < length) {
+            await this.fillInput(length)?;
+        }
+        let kind = this.input[this.inStart];
+        let status = this.input[this.inStart + 1];
+        this.spid = this.input.view().readBE<u16>(this.inStart + 4);
+        if (this.payStart > 0 && (this.payStart == this.payload.length || this.payStart >= READ_CHUNK)) {
+            let end = this.payload.length;
+            this.payload.copyWithin(this.payStart, 0, end - this.payStart);
+            this.payload.truncate(end - this.payStart);
+            this.payStart = 0;
+        }
+        let from = this.inStart + 8;
+        allocated(this.payload.extend(this.input[from..this.inStart + length]))?;
+        this.inStart += length;
+        if ((status & STATUS_EOM) != 0) {
+            this.messageDone = true;
+        }
+        return Ok(kind);
+    }
+
+    /// Reads a whole message into `payload` (from 0).
+    async fn readWholeMessage(borrow mut this) -> Result<void, MsSqlError> {
+        this.payload.clear();
+        this.payStart = 0;
+        this.messageDone = false;
+        while (!this.messageDone) {
+            await this.readPacket()?;
+        }
+        return Ok();
+    }
+
+    // ---- Tokens ----
+
+    /// Readies for a response: forgets the last one's messages and state.
+    fn beginResponse(borrow mut this) {
+        this.payload.clear();
+        this.payStart = 0;
+        this.messageDone = false;
+        this.ended = false;
+        this.errorList.clear();
+        this.infoList.clear();
+        this.status = null;
+        this.outputs.clear();
+        this.meta.clear();
+    }
+
+    /// Reads tokens until one the caller must see: a result's columns (now in `meta`), a row (stored in `rows`),
+    /// a DONE (in `lastDone`), or the end of the response.
+    async fn step(borrow mut this, rows: borrow mut MsSqlRows) -> Result<u8, MsSqlError> {
+        loop {
+            if (this.ended) {
+                return Ok(EV_END);
+            }
+            let r = this.parseToken(rows)?;
+            if (r == 0) {
+                continue;
+            }
+            if (r == NEED) {
+                if (this.messageDone) {
+                    return Err(MsSqlError.Protocol); // the message ended inside a token
+                }
+                await this.readPacket()?;
+                while (!this.messageDone && this.payload.length - this.payStart < this.needBytes) {
+                    await this.readPacket()?;
+                }
+                continue;
+            }
+            if (r == EV_DONE && this.ended) {
+                while (!this.messageDone) {
+                    await this.readPacket()?;
+                }
+            }
+            return Ok(r);
+        }
+    }
+
+    /// Reads the token at `payStart`: 0 when it was handled here, an `EV_` code, or `NEED`.
+    fn parseToken(borrow mut this, rows: borrow mut MsSqlRows) -> Result<u8, MsSqlError> {
+        let at = this.payStart;
+        let avail = this.payload.length - at;
+        if (avail == 0) {
+            this.needBytes = 1;
+            return Ok(NEED);
+        }
+        let data = this.payload.view();
+        let token = data[at];
+        var need: usize = 0;
+        if (token == 0xD1 || token == 0xD2) {
+            match (rows.readRow(data, at + 1, borrow this.meta, token == 0xD2, mut need)?) {
+                Some(end) => {
+                    this.payStart = end;
+                    return Ok(EV_ROW);
+                }
+                null => {
+                    this.needBytes = 1 + need;
+                    return Ok(NEED);
+                }
+            }
+        }
+        if (token == 0x81) {
+            match (readColumnMetadata(data, at + 1, mut this.meta)?) {
+                Some(end) => {
+                    this.payStart = end;
+                    return Ok(EV_COLUMNS);
+                }
+                null => {
+                    this.needBytes = avail + 1;
+                    return Ok(NEED);
+                }
+            }
+        }
+        if (token == 0xFD || token == 0xFE || token == 0xFF) {
+            if (avail < 13) {
+                this.needBytes = 13;
+                return Ok(NEED);
+            }
+            let done = DoneInfo {
+                token: token,
+                status: data.readLE<u16>(at + 1),
+                command: data.readLE<u16>(at + 3),
+                count: data.readLE<u64>(at + 5),
+            };
+            this.payStart = at + 13;
+            this.lastDone = done;
+            if (token != 0xFF && (done.status & DONE_MORE) == 0) {
+                this.ended = true;
+            }
+            return Ok(EV_DONE);
+        }
+        if (token == 0x79) {
+            if (avail < 5) {
+                this.needBytes = 5;
+                return Ok(NEED);
+            }
+            this.status = data.readLE<i32>(at + 1);
+            this.payStart = at + 5;
+            return Ok(0);
+        }
+        if (token == 0xAC) {
+            match (readReturnValue(data, at + 1, mut this.outputs, mut need)?) {
+                Some(end) => {
+                    this.payStart = end;
+                    return Ok(0);
+                }
+                null => {
+                    this.needBytes = if (need > 0) 1 + need else avail + 1;
+                    return Ok(NEED);
+                }
+            }
+        }
+        if (token == 0xAE) {
+            // FEATUREEXTACK: features (an id, a four-byte length, data) up to 0xFF.
+            var pos = at + 1;
+            loop {
+                if (pos >= data.length) {
+                    this.needBytes = avail + 1;
+                    return Ok(NEED);
+                }
+                if (data[pos] == 0xFF) {
+                    this.payStart = pos + 1;
+                    return Ok(0);
+                }
+                if (pos + 5 > data.length) {
+                    this.needBytes = avail + 1;
+                    return Ok(NEED);
+                }
+                pos += 5 + (data.readLE<u32>(pos + 1) as usize);
+            }
+        }
+        if (token == 0xE4) {
+            // SESSIONSTATE: a four-byte length.
+            if (avail < 5) {
+                this.needBytes = 5;
+                return Ok(NEED);
+            }
+            let length = data.readLE<u32>(at + 1) as usize;
+            if (avail < 5 + length) {
+                this.needBytes = 5 + length;
+                return Ok(NEED);
+            }
+            this.payStart = at + 5 + length;
+            return Ok(0);
+        }
+        if (token == 0xAA || token == 0xAB || token == 0xE3 || token == 0xAD || token == 0xED || token == 0xA9 ||
+            token == 0xA5 || token == 0xA4 || token == 0xA3) {
+            // A two-byte length, then the body.
+            if (avail < 3) {
+                this.needBytes = 3;
+                return Ok(NEED);
+            }
+            let length = data.readLE<u16>(at + 1) as usize;
+            if (avail < 3 + length) {
+                this.needBytes = 3 + length;
+                return Ok(NEED);
+            }
+            this.tokenBody.clear();
+            allocated(this.tokenBody.extend(data[at + 3..at + 3 + length]))?;
+            this.payStart = at + 3 + length;
+            this.handleToken(token)?;
+            return Ok(0);
+        }
+        return Err(MsSqlError.Protocol); // ALTMETADATA, ALTROW (COMPUTE BY), or something unknown
+    }
+
+    /// Handles a small token whose body is in `tokenBody`.
+    fn handleToken(borrow mut this, token: u8) -> Result<void, MsSqlError> {
+        if (token == 0xAA || token == 0xAB) {
+            let message = parseMessage(this.tokenBody.view())?;
+            if (token == 0xAA) {
+                if (message.severity >= 20) {
+                    this.fatal = true;
+                }
+                if (this.errorList.length < MAX_ERRORS) {
+                    allocated(this.errorList.push(message))?;
+                }
+            } else if (this.infoList.length < MAX_INFOS) {
+                allocated(this.infoList.push(message))?;
+            }
+            return Ok();
+        }
+        if (token == 0xE3) {
+            return this.envChange();
+        }
+        if (token == 0xAD) {
+            // LOGINACK: interface, TDS version, program name, version.
+            let body = this.tokenBody.view();
+            if (body.length < 10) {
+                return Err(MsSqlError.Protocol);
+            }
+            let nameEnd = 6 + (body[5] as usize) * 2;
+            if (nameEnd + 4 > body.length) {
+                return Err(MsSqlError.Protocol);
+            }
+            this.version = MsServerVersion {
+                major: body[nameEnd],
+                minor: body[nameEnd + 1],
+                build: body.readBE<u16>(nameEnd + 2),
+            };
+            this.loginAcked = true;
+            return Ok();
+        }
+        if (token == 0xED) {
+            this.sspi.clear();
+            return allocated(this.sspi.extend(this.tokenBody.view()));
+        }
+        return Ok(); // ORDER, COLINFO, TABNAME, DATACLASSIFICATION: not needed
+    }
+
+    /// ENVCHANGE (2.2.7.9): the session changed.
+    fn envChange(borrow mut this) -> Result<void, MsSqlError> {
+        let body = this.tokenBody.view();
+        if (body.length < 1) {
+            return Err(MsSqlError.Protocol);
+        }
+        let kind = body[0];
+        if (kind == 1) {
+            // The database: new name (B_VARCHAR), old name.
+            this.databaseName.clear();
+            match (readBVarchar(body, 1, body.length, mut this.databaseName)?) {
+                Some(_) => {}
+                null => { return Err(MsSqlError.Protocol); }
+            }
+        } else if (kind == 4) {
+            // The packet size, as text.
+            var text = String.create();
+            match (readBVarchar(body, 1, body.length, mut text)?) {
+                Some(_) => {}
+                null => { return Err(MsSqlError.Protocol); }
+            }
+            match (text.view().parseInt<usize>()) {
+                Some(n) => {
+                    if (n >= 512 && n <= 32767) {
+                        this.packetSize = n;
+                    }
+                }
+                null => {}
+            }
+        } else if (kind == 7) {
+            // The database's collation: five bytes (B_VARBYTE).
+            if (body.length >= 7 && body[1] == 5) {
+                this.session.collation[..].copyFrom(body[2..7]);
+                this.session.codePage = collationCodePage(body[2..7]);
+            }
+        } else if (kind == 8) {
+            // A transaction began: its descriptor.
+            if (body.length >= 10 && body[1] == 8) {
+                this.descriptor = body.readLE<u64>(2);
+            }
+        } else if (kind == 9 || kind == 10 || kind == 17) {
+            this.descriptor = 0; // committed, rolled back, or ended
+        } else if (kind == 20) {
+            // Routing: length (2), protocol (1, 0 = TCP), port (2), server (US_VARCHAR).
+            if (body.length < 8 || body[3] != 0) {
+                return Err(MsSqlError.Protocol);
+            }
+            this.routePort = body.readLE<u16>(4);
+            let units = body.readLE<u16>(6) as usize;
+            if (8 + units * 2 > body.length) {
+                return Err(MsSqlError.Protocol);
+            }
+            this.routeHost.clear();
+            allocated(Utf16.decodeInto(body[8..8 + units * 2], mut this.routeHost))?;
+        }
+        return Ok();
+    }
+
+    /// Reads to the end of the response, keeping nothing but its messages and state.
+    async fn drainResponse(borrow mut this) -> Result<void, MsSqlError> {
+        var scratch = MsSqlRows.create();
+        loop {
+            let ev = await this.step(mut scratch)?;
+            if (ev == EV_ROW) {
+                scratch.clearRows();
+            } else if (ev == EV_END) {
+                return Ok();
+            }
+        }
+    }
+
+    // ---- Exchanges ----
+
+    /// Fails unless the connection can start an operation.
+    fn ready(borrow this) -> Result<void, MsSqlError> {
+        if (this.busy) {
+            return Err(MsSqlError.Broken);
+        }
+        if (this.stream != S_IDLE) {
+            return Err(MsSqlError.WrongState);
+        }
+        return Ok();
+    }
+
+    /// Builds the request for `sql` with `params`: an RPC to sp_executesql, or a plain batch without parameters.
+    fn writeQuery(borrow mut this, sql: StringView, params: borrow MsSqlParams) -> Result<u8, MsSqlError> {
+        this.ready()?;
+        if (params.count() == 0) {
+            allocated(putSqlBatch(mut this.output, sql, this.descriptor))?;
+            return Ok(PKT_SQL_BATCH);
+        }
+        putExecuteSql(mut this.output, sql, params, this.descriptor, this.session)?;
+        return Ok(PKT_RPC);
+    }
+
+    /// Reads the response, keeping the first result set in `first` (KEEP_FIRST), every one in `rest` (KEEP_ALL),
+    /// or none; gives the rows the statements affected.
+    async fn collect(
+        borrow mut this,
+        first: borrow mut MsSqlRows,
+        rest: borrow mut Vector<MsSqlRows>,
+        keep: u8,
+    ) -> Result<u64, MsSqlError> {
+        var scratch = MsSqlRows.create();
+        // Where rows go: 0 nowhere yet, 1 `first`, 2 the last of `rest`, 3 dropped.
+        var target: u8 = 0;
+        var results: usize = 0;
+        var total: u64 = 0;
+        loop {
+            let last = if (rest.length > 0) rest.length - 1 else 0usize;
+            let ev = if (target == 1) await this.step(first)? else (if (target == 2) await this.step(
+                mut rest[last],
+            )? else await this.step(mut scratch)?);
+            if (ev == EV_ROW) {
+                if (target == 3 || target == 0) {
+                    scratch.clearRows();
+                }
+            } else if (ev == EV_COLUMNS) {
+                results += 1;
+                if (results == 1 && keep != KEEP_NONE) {
+                    first.clear();
+                    first.describe(borrow this.meta)?;
+                    target = 1;
+                } else if (keep == KEEP_ALL) {
+                    var set = MsSqlRows.create();
+                    set.describe(borrow this.meta)?;
+                    allocated(rest.push(set))?;
+                    target = 2;
+                } else {
+                    scratch.clear();
+                    target = 3;
+                }
+            } else if (ev == EV_DONE) {
+                let d = this.lastDone;
+                if ((d.status & DONE_COUNT) != 0) {
+                    if (d.command == CMD_SELECT) {
+                        if (target == 1) {
+                            first.setAffected(d.count);
+                        } else if (target == 2) {
+                            rest[last].setAffected(d.count);
+                        }
+                    } else if (d.token != 0xFE) {
+                        total += d.count;
+                    }
+                }
+                if (target != 0) {
+                    target = 3;
+                }
+            } else if (ev == EV_END) {
+                break;
+            }
+        }
+        this.busy = this.fatal;
+        if (this.errorList.length > 0) {
+            return Err(MsSqlError.Server);
+        }
+        return Ok(total);
+    }
+
+    /// Skips to the next result's columns (true), or to the end of the response (false).
+    async fn advanceToResult(borrow mut this) -> Result<bool, MsSqlError> {
+        var scratch = MsSqlRows.create();
+        loop {
+            let ev = await this.step(mut scratch)?;
+            if (ev == EV_ROW) {
+                scratch.clearRows();
+            } else if (ev == EV_COLUMNS) {
+                this.stream = S_ROWS;
+                return Ok(true);
+            } else if (ev == EV_DONE) {
+                this.countDone();
+            } else if (ev == EV_END) {
+                return this.endStream();
+            }
+        }
+    }
+
+    fn countDone(borrow mut this) {
+        let d = this.lastDone;
+        if ((d.status & DONE_COUNT) != 0 && d.command != CMD_SELECT && d.token != 0xFE) {
+            this.streamCount += d.count;
+        }
+    }
+
+    /// The streamed response has ended.
+    fn endStream(borrow mut this) -> Result<bool, MsSqlError> {
+        this.stream = S_IDLE;
+        this.busy = this.fatal;
+        if (this.errorList.length > 0) {
+            return Err(MsSqlError.Server);
+        }
+        return Ok(false);
+    }
+
+    /// Up to `max` rows of the current result into `rows`.
+    async fn fetchRows(borrow mut this, rows: borrow mut MsSqlRows, max: usize) -> Result<bool, MsSqlError> {
+        rows.clear();
+        if (this.stream != S_ROWS) {
+            return Ok(false);
+        }
+        rows.describe(borrow this.meta)?;
+        loop {
+            let ev = await this.step(rows)?;
+            if (ev == EV_ROW) {
+                if (rows.rowCount() >= max) {
+                    return Ok(true);
+                }
+            } else if (ev == EV_COLUMNS) {
+                this.stream = S_NEXT;
+                return Ok(rows.rowCount() > 0);
+            } else if (ev == EV_DONE) {
+                let d = this.lastDone;
+                if ((d.status & DONE_COUNT) != 0 && d.command == CMD_SELECT) {
+                    rows.setAffected(d.count);
+                }
+                this.countDone();
+                this.stream = S_BETWEEN;
+                return Ok(rows.rowCount() > 0);
+            } else if (ev == EV_END) {
+                let had = rows.rowCount() > 0;
+                this.endStream()?;
+                return Ok(had);
+            }
+        }
+    }
+
+    /// One operation of the exchange, as `run` asks.
+    async fn perform(
+        borrow mut this,
+        op: u8,
+        kind: u8,
+        max: usize,
+        rows: borrow mut MsSqlRows,
+        rest: borrow mut Vector<MsSqlRows>,
+        keep: u8,
+    ) -> Result<u64, MsSqlError> {
+        if (op == OP_COLLECT || op == OP_START) {
+            await this.sendMessage(kind)?;
+            this.beginResponse();
+            if (op == OP_COLLECT) {
+                return await this.collect(rows, rest, keep);
+            }
+            this.streamCount = 0;
+            return if (await this.advanceToResult()?) Ok(1u64) else Ok(0u64);
+        }
+        if (op == OP_FETCH) {
+            return if (await this.fetchRows(rows, max)?) Ok(1u64) else Ok(0u64);
+        }
+        if (op == OP_NEXT) {
+            if (this.stream == S_NEXT) {
+                this.stream = S_ROWS;
+                return Ok(1);
+            }
+            var scratch = MsSqlRows.create();
+            while (this.stream == S_ROWS) {
+                await this.fetchRows(mut scratch, 1024)?;
+            }
+            if (this.stream == S_NEXT) {
+                this.stream = S_ROWS;
+                return Ok(1);
+            }
+            if (this.stream == S_BETWEEN) {
+                return if (await this.advanceToResult()?) Ok(1u64) else Ok(0u64);
+            }
+            return Ok(0);
+        }
+        // OP_FINISH: read everything left.
+        var scratch = MsSqlRows.create();
+        while (this.stream != S_IDLE) {
+            if (this.stream == S_NEXT) {
+                this.stream = S_ROWS;
+            }
+            if (this.stream == S_ROWS) {
+                await this.fetchRows(mut scratch, 1024)?;
+            } else {
+                await this.advanceToResult()?;
+            }
+        }
+        return Ok(this.streamCount);
+    }
+
+    /// Runs `perform` under the command timeout, and leaves the connection in a known state whatever happens.
+    async fn run(
+        borrow mut this,
+        op: u8,
+        kind: u8,
+        max: usize,
+        rows: borrow mut MsSqlRows,
+        rest: borrow mut Vector<MsSqlRows>,
+        keep: u8,
+    ) -> Result<u64, MsSqlError> {
+        if (op == OP_COLLECT || op == OP_START) {
+            this.busy = true;
+        }
+        let ms = this.commandMillis;
+        let outcome: Result<u64, MsSqlError> = if (ms == 0) await this.perform(op, kind, max, rows, rest, keep)
+            else await Async.timeout(
+                ms,
+                MsSqlError.TimedOut,
+                async () => await this.perform(op, kind, max, rows, rest, keep),
+            );
+        match (outcome) {
+            Ok(v) => { return Ok(v); }
+            Err(MsSqlError.Server) => { return Err(MsSqlError.Server); }
+            Err(MsSqlError.TimedOut) => {
+                if (!this.sending) {
+                    match (await this.recoverWithin()) {
+                        Ok() => {}
+                        Err(_) => {
+                            this.busy = true;
+                            this.stream = S_IDLE;
+                        }
+                    }
+                } else {
+                    this.busy = true;
+                    this.stream = S_IDLE;
+                }
+                return Err(MsSqlError.TimedOut);
+            }
+            Err(e) => {
+                this.busy = true; // the stream is out of step
+                this.stream = S_IDLE;
+                return Err(e);
+            }
+        }
+    }
+
+    /// Sends an attention and reads up to its acknowledgement, within `ATTENTION_TIMEOUT_MS`.
+    async fn recoverWithin(borrow mut this) -> Result<void, MsSqlError> {
+        return await Async.timeout(ATTENTION_TIMEOUT_MS, MsSqlError.TimedOut, async () => await this.attention());
+    }
+
+    /// An attention (2.2.1.7): the server stops the request and answers with a DONE carrying DONE_ATTN, after
+    /// whatever of the response it had sent.
+    async fn attention(borrow mut this) -> Result<void, MsSqlError> {
+        this.output.clear();
+        await this.sendMessage(PKT_ATTENTION)?;
+        var scratch = MsSqlRows.create();
+        loop {
+            if (this.ended) {
+                // The response is over; the acknowledgement comes in a message of its own.
+                if (this.payStart < this.payload.length) {
+                    return Err(MsSqlError.Protocol);
+                }
+                this.ended = false;
+                this.messageDone = false;
+            }
+            let ev = await this.step(mut scratch)?;
+            if (ev == EV_ROW) {
+                scratch.clearRows();
+            } else if (ev == EV_DONE && (this.lastDone.status & DONE_ATTN) != 0) {
+                while (!this.messageDone) {
+                    await this.readPacket()?;
+                }
+                this.payload.clear();
+                this.payStart = 0;
+                this.ended = true;
+                this.stream = S_IDLE;
+                this.busy = this.fatal;
+                return Ok();
+            }
+        }
+    }
+
+    // ---- Queries ----
+
+    /// Runs `sql` with `params` and gives the first result set's rows (an empty `MsSqlRows` when it returns
+    /// none). Further result sets are read and dropped; use `queryAll` to keep them.
+    public async fn query(
+        borrow mut this,
+        sql: StringView,
+        params: borrow MsSqlParams,
+    ) -> Result<MsSqlRows, MsSqlError> {
+        var rows = MsSqlRows.create();
+        await this.queryInto(sql, params, mut rows)?;
+        return Ok(rows);
+    }
+
+    /// As `query`, into `rows`, which is cleared first; reusing one `MsSqlRows` reuses its memory.
+    public async fn queryInto(
+        borrow mut this,
+        sql: StringView,
+        params: borrow MsSqlParams,
+        rows: borrow mut MsSqlRows,
+    ) -> Result<void, MsSqlError> {
+        let kind = this.writeQuery(sql, params)?;
+        rows.clear();
+        var rest = Vector<MsSqlRows>.create();
+        await this.run(OP_COLLECT, kind, 0, rows, mut rest, KEEP_FIRST)?;
+        return Ok();
+    }
+
+    /// Runs `sql` with `params` and gives every result set, the output parameters and the rows affected.
+    public async fn queryAll(
+        borrow mut this,
+        sql: StringView,
+        params: borrow MsSqlParams,
+    ) -> Result<MsSqlResults, MsSqlError> {
+        let kind = this.writeQuery(sql, params)?;
+        return await this.collectResults(kind);
+    }
+
+    async fn collectResults(borrow mut this, kind: u8) -> Result<MsSqlResults, MsSqlError> {
+        var results = MsSqlResults.create();
+        var first = MsSqlRows.create();
+        var rest = Vector<MsSqlRows>.create();
+        results.affected = await this.run(OP_COLLECT, kind, 0, mut first, mut rest, KEEP_ALL)?;
+        // `first` holds the first result set and `rest` the others.
+        var all = Vector<MsSqlRows>.create();
+        if (first.columnCount() > 0 || rest.length > 0) {
+            allocated(all.push(first))?;
+        }
+        loop {
+            match (rest.pop()) {
+                Some(r) => { allocated(all.push(r))?; }
+                null => { break; }
+            }
+        }
+        // `rest` popped in reverse; put the sets after the first back in order.
+        if (all.length > 2) {
+            var lo: usize = 1;
+            var hi = all.length - 1;
+            while (lo < hi) {
+                all.swap(lo, hi);
+                lo += 1;
+                hi -= 1;
+            }
+        }
+        results.sets = all;
+        results.out = replace(mut this.outputs, MsSqlRows.create());
+        results.status = this.status;
+        return Ok(results);
+    }
+
+    /// Runs `sql` with `params` for its effect, and gives the number of rows its INSERT, UPDATE, DELETE and MERGE
+    /// statements affected (0 under `SET NOCOUNT ON`). Rows a SELECT returns are read and dropped.
+    public async fn execute(borrow mut this, sql: StringView, params: borrow MsSqlParams) -> Result<u64, MsSqlError> {
+        let kind = this.writeQuery(sql, params)?;
+        var none = MsSqlRows.create();
+        var rest = Vector<MsSqlRows>.create();
+        return await this.run(OP_COLLECT, kind, 0, mut none, mut rest, KEEP_NONE);
+    }
+
+    /// Runs `sql`, a batch without parameters: DDL, a script of several statements, `SET` options.
+    public async fn batch(borrow mut this, sql: StringView) -> Result<u64, MsSqlError> {
+        let none = MsSqlParams.create();
+        return await this.execute(sql, none);
+    }
+
+    /// Calls stored procedure `name` with `params`, which are passed by name (`params.name("@id")` before each);
+    /// output parameters (`params.output()`) come back in `outputs()`, the `RETURN` value in `returnStatus()`.
+    public async fn callProcedure(
+        borrow mut this,
+        name: StringView,
+        params: borrow MsSqlParams,
+    ) -> Result<MsSqlResults, MsSqlError> {
+        this.ready()?;
+        putProcedureCall(mut this.output, name, params, this.descriptor, this.session)?;
+        return await this.collectResults(PKT_RPC);
+    }
+
+    /// Runs `sql` (a `SELECT … FOR JSON`) and appends its JSON text to `out`. The server splits long JSON over
+    /// several rows of its first column; they are joined here.
+    public async fn queryJson(
+        borrow mut this,
+        sql: StringView,
+        params: borrow MsSqlParams,
+        out: borrow mut String,
+    ) -> Result<void, MsSqlError> {
+        let rows = await this.query(sql, params)?;
+        for (r in 0..rows.rowCount()) {
+            match (rows.text(r, 0)) {
+                Some(t) => { allocated(out.append(t))?; }
+                null => {}
+            }
+        }
+        return Ok();
+    }
+
+    // ---- Streaming ----
+
+    /// Starts `sql` with `params` without reading its rows yet: then `fetch` gives them in batches, `nextResult`
+    /// moves to the next result set, and `finish` reads what is left. True when the first result set is ready;
+    /// false when the batch returned no rows at all (it has then ended). No other operation can run until the
+    /// stream ends.
+    public async fn start(borrow mut this, sql: StringView, params: borrow MsSqlParams) -> Result<bool, MsSqlError> {
+        let kind = this.writeQuery(sql, params)?;
+        var none = MsSqlRows.create();
+        var rest = Vector<MsSqlRows>.create();
+        return Ok(await this.run(OP_START, kind, 0, mut none, mut rest, KEEP_NONE)? == 1);
+    }
+
+    /// Replaces `rows` with up to `max` (at least 1) further rows of the current result set; false once it has
+    /// none left (`rows` is then empty).
+    public async fn fetch(borrow mut this, rows: borrow mut MsSqlRows, max: usize) -> Result<bool, MsSqlError> {
+        if (this.busy && this.stream == S_IDLE) {
+            return Err(MsSqlError.Broken);
+        }
+        var rest = Vector<MsSqlRows>.create();
+        let limit = if (max == 0) 1usize else max;
+        return Ok(await this.run(OP_FETCH, 0, limit, rows, mut rest, KEEP_NONE)? == 1);
+    }
+
+    /// Moves to the next result set, skipping the rest of the current one: true when there is one.
+    public async fn nextResult(borrow mut this) -> Result<bool, MsSqlError> {
+        if (this.stream == S_IDLE) {
+            return Ok(false);
+        }
+        var none = MsSqlRows.create();
+        var rest = Vector<MsSqlRows>.create();
+        return Ok(await this.run(OP_NEXT, 0, 0, mut none, mut rest, KEEP_NONE)? == 1);
+    }
+
+    /// Reads what is left of a streamed response, and gives the rows its statements affected. `Server` if a
+    /// statement failed.
+    public async fn finish(borrow mut this) -> Result<u64, MsSqlError> {
+        if (this.stream == S_IDLE) {
+            return Ok(this.streamCount);
+        }
+        var none = MsSqlRows.create();
+        var rest = Vector<MsSqlRows>.create();
+        return await this.run(OP_FINISH, 0, 0, mut none, mut rest, KEEP_NONE);
+    }
+
+    /// Stops a streamed response early: the server is told to stop (an attention), what it already sent is
+    /// skipped, and the connection is ready again. Cheaper than `finish` when much is left.
+    public async fn cancel(borrow mut this) -> Result<void, MsSqlError> {
+        if (this.stream == S_IDLE) {
+            return Ok();
+        }
+        match (await this.recoverWithin()) {
+            Ok() => { return Ok(); }
+            Err(e) => {
+                this.busy = true;
+                this.stream = S_IDLE;
+                return Err(e);
+            }
+        }
+    }
+
+    // ---- Backups ----
+
+    /// `BACKUP DATABASE` `database` to the file `path` on the server's disk, with `FORMAT` (a new media set) and
+    /// `COMPRESSION` when asked. The name and the path travel as parameters, never spliced into the SQL.
+    public async fn backupDatabase(
+        borrow mut this,
+        database: StringView,
+        path: StringView,
+        compression: bool,
+        format: bool,
+    ) -> Result<void, MsSqlError> {
+        var p = MsSqlParams.create();
+        p.text(database)?;
+        p.text(path)?;
+        let sql =
+            if (compression && format) "BACKUP DATABASE @p1 TO DISK = @p2 WITH FORMAT, COMPRESSION"
+                else (if (compression) "BACKUP DATABASE @p1 TO DISK = @p2 WITH COMPRESSION"
+                    else (if (format) "BACKUP DATABASE @p1 TO DISK = @p2 WITH FORMAT"
+                        else "BACKUP DATABASE @p1 TO DISK = @p2"));
+        await this.execute(sql, p)?;
+        return Ok();
+    }
+
+    /// `RESTORE DATABASE` `database` from the backup file `path` on the server's disk, `WITH REPLACE`.
+    public async fn restoreDatabase(
+        borrow mut this,
+        database: StringView,
+        path: StringView,
+    ) -> Result<void, MsSqlError> {
+        var p = MsSqlParams.create();
+        p.text(database)?;
+        p.text(path)?;
+        await this.execute("RESTORE DATABASE @p1 FROM DISK = @p2 WITH REPLACE", p)?;
+        return Ok();
+    }
+
+    // ---- Transactions ----
+
+    /// Begins a transaction at the session's isolation level (READ COMMITTED unless changed).
+    public async fn begin(borrow mut this) -> Result<void, MsSqlError> {
+        await this.batch("BEGIN TRANSACTION")?;
+        return Ok();
+    }
+
+    /// Sets the session's isolation level to `level`, then begins a transaction. The level stays with the session
+    /// after the transaction (a pooled connection is reset when its lease ends).
+    public async fn beginWith(borrow mut this, level: MsIsolation) -> Result<void, MsSqlError> {
+        let sql = match (level) {
+            MsIsolation.ReadUncommitted => "SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED; BEGIN TRANSACTION",
+            MsIsolation.ReadCommitted => "SET TRANSACTION ISOLATION LEVEL READ COMMITTED; BEGIN TRANSACTION",
+            MsIsolation.RepeatableRead => "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ; BEGIN TRANSACTION",
+            MsIsolation.Serializable => "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE; BEGIN TRANSACTION",
+            MsIsolation.Snapshot => "SET TRANSACTION ISOLATION LEVEL SNAPSHOT; BEGIN TRANSACTION",
+        };
+        await this.batch(sql)?;
+        return Ok();
+    }
+
+    /// Commits the open transaction; `WrongState` when none is open.
+    public async fn commit(borrow mut this) -> Result<void, MsSqlError> {
+        if (this.descriptor == 0) {
+            return Err(MsSqlError.WrongState);
+        }
+        await this.batch("COMMIT TRANSACTION")?;
+        return Ok();
+    }
+
+    /// Rolls the open transaction back; `WrongState` when none is open.
+    public async fn rollback(borrow mut this) -> Result<void, MsSqlError> {
+        if (this.descriptor == 0) {
+            return Err(MsSqlError.WrongState);
+        }
+        await this.batch("IF @@TRANCOUNT > 0 ROLLBACK TRANSACTION")?;
+        return Ok();
+    }
+
+    /// Whether a transaction is open, by `begin` or by the SQL itself.
+    public fn inTransaction(borrow this) -> bool => this.descriptor != 0;
+
+    // ---- State ----
+
+    /// Every ERROR message of the last operation, in the order the server sent them.
+    public fn errors(borrow this) -> Slice<MsSqlMessage> => this.errorList.view();
+
+    /// The first ERROR message of the last operation (usually the one that matters), or null.
+    public fn lastError(borrow this) -> (borrow MsSqlMessage)? {
+        if (this.errorList.length == 0) {
+            return null;
+        }
+        return borrow this.errorList[0];
+    }
+
+    /// The informational messages of the last operation: `PRINT` output, `RAISERROR` below severity 11, the
+    /// login's "changed database context".
+    public fn messages(borrow this) -> Slice<MsSqlMessage> => this.infoList.view();
+
+    /// Whether the connection can take another operation: not broken, and no streamed query unfinished.
+    public fn isReady(borrow this) -> bool => !this.busy && this.stream == S_IDLE;
+
+    /// Whether the session is encrypted after the login.
+    public fn isEncrypted(borrow this) -> bool => this.tls != null;
+
+    /// The server's version.
+    public fn serverVersion(borrow this) -> MsServerVersion => this.version;
+
+    /// The current database, as the server last said (after `USE`, too).
+    public fn database(borrow this) -> StringView => this.databaseName.view();
+
+    /// The server's id for this session (`@@SPID`).
+    public fn processId(borrow this) -> u16 => this.spid;
+
+    /// The packet size the server agreed on.
+    public fn negotiatedPacketSize(borrow this) -> usize => this.packetSize;
+
+    /// Sets the command timeout for this connection's operations, in milliseconds (0: none).
+    public fn setCommandTimeout(borrow mut this, millis: u64) {
+        this.commandMillis = millis;
+    }
+
+    /// Asks the server to reset the session (sp_reset_connection: temporary tables, SET options, the isolation
+    /// level) as part of the next request, as a pool does between leases.
+    public fn resetSession(borrow mut this) {
+        this.resetPending = true;
+    }
+
+    /// Tries to make a `Broken` connection usable again after an operation was cancelled from outside (an
+    /// `Async.timeout` of the caller's, a lost race): sends an attention and skips the rest of the response. Fails
+    /// if the cancellation struck while a request was being written, or the server does not answer in time.
+    public async fn recover(borrow mut this) -> Result<void, MsSqlError> {
+        if (!this.busy) {
+            return Ok();
+        }
+        if (this.sending || this.fatal || !this.loginAcked) {
+            return Err(MsSqlError.Broken);
+        }
+        return await this.recoverWithin();
+    }
+
+    /// Ends the session: TLS's close_notify, then the socket closes when the connection is dropped. Dropping it
+    /// without `close` is safe too.
+    public async fn close(borrow mut this) -> Result<void, MsSqlError> {
+        this.busy = true;
+        var pending = false;
+        match (borrow mut this.tls) {
+            Some(engine) => {
+                match (engine.shutdown()) {
+                    Ok() => {}
+                    Err(_) => {}
+                }
+                this.cipher.clear();
+                match (engine.takeAllOutput(mut this.cipher)) {
+                    Ok() => { pending = this.cipher.length > 0; }
+                    Err(_) => {}
+                }
+            }
+            null => {}
+        }
+        if (pending) {
+            match (await this.tcp.write(this.cipher.view())) {
+                Ok() => {}
+                Err(_) => {}
+            }
+        }
+        match (this.tcp.shutdownWrite()) {
+            Ok() => {}
+            Err(_) => {}
+        }
+        return Ok();
+    }
+}
+
+/// A RETURNVALUE token's body (2.2.7.18) at `at`, added to `outputs` as a column named after the parameter
+/// (without its `@`).
+fn readReturnValue(
+    data: Slice<u8>,
+    at: usize,
+    outputs: borrow mut MsSqlRows,
+    need: borrow mut usize,
+) -> Result<usize?, MsSqlError> {
+    // ParamOrdinal (2), ParamName (B_VARCHAR), Status (1), UserType (4), Flags (2), TYPE_INFO, value.
+    if (at + 3 > data.length) {
+        return Ok(null);
+    }
+    let units = data[at + 2] as usize;
+    let nameEnd = at + 3 + units * 2;
+    if (nameEnd + 7 > data.length) {
+        return Ok(null);
+    }
+    var name = Vector<u8>.create();
+    allocated(Utf16.decodeBytes(data[at + 3..nameEnd], mut name))?;
+    let bare = if (name.length > 0 && name[0] == '@') 1usize else 0usize;
+    var column = blankColumn();
+    column.flags = data.readLE<u16>(nameEnd + 5);
+    let typeEnd = readTypeInfo(data, nameEnd + 7, mut column, false)? ?? { return Ok(null); };
+    var valueNeed: usize = 0;
+    match (outputs.addOutput(name[bare..], column, data, typeEnd, mut valueNeed)?) {
+        Some(end) => { return Ok(Some(end)); }
+        null => {
+            if (valueNeed > 0) {
+                need = typeEnd - at + valueNeed;
+            }
+            return Ok(null);
+        }
+    }
+}
+
+fn tlsEngine(config: borrow TlsConfig, host: StringView) -> Result<TlsEngine, MsSqlError> {
+    match (TlsEngine.client(config, host)) {
+        Ok(e) => { return Ok(e); }
+        Err(e) => { return Err(MsSqlError.Tls(e)); }
+    }
+}
+
+fn buildPreLoginOrFail(encryption: u8, instance: StringView, out: borrow mut Vector<u8>) -> Result<void, MsSqlError> =>
+    allocated(buildPreLogin(encryption, instance, out));
+
+fn tlsResult<T>(outcome: Result<T, TlsError>) -> Result<T, MsSqlError> {
+    match (outcome) {
+        Ok(v) => { return Ok(v); }
+        Err(e) => { return Err(MsSqlError.Tls(e)); }
+    }
+}
+
+fn ioResult<T>(outcome: Result<T, AsyncError>) -> Result<T, MsSqlError> {
+    match (outcome) {
+        Ok(v) => { return Ok(v); }
+        Err(e) => { return Err(MsSqlError.Io(e)); }
+    }
+}
