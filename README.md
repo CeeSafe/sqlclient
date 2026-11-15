@@ -71,7 +71,9 @@ let encrypted = db.isEncrypted();                    // false with Encrypt=false
 await db.close()?;
 ```
 
-A named instance (`Server=db\SQLEXPRESS`) is looked up through SQL Server Browser. A URL works too:
+For an availability group listener, add `MultiSubnetFailover=true`; for Azure SQL's serverless databases, which
+take a while to resume, `ConnectRetryCount=3;ConnectRetryInterval=10`. A named instance (`Server=db\SQLEXPRESS`) is
+looked up through SQL Server Browser. A URL works too:
 `sqlserver://app:secret@db.example.org:1433?database=shop`.
 
 ### Typed parameters and values
@@ -291,8 +293,12 @@ result set as tab-separated text, then the server's messages.
     `UnsupportedAuthentication`. A key ADO.NET does not have fails with `Config`, as its "Keyword not supported".
   - The server is `host`, `host,port`, `tcp:host,port`, `[v6],port`, or `host\instance`; a named instance's port is
     asked of SQL Server Browser (UDP 1434).
-  - Every address a name resolves to is tried in order, and Azure SQL's gateway redirect is followed.
-  - `connect` is bounded by the connect timeout (15 s).
+  - Every address a name resolves to is tried in order (`IPAddressPreference` picks IPv4 or IPv6 first), or all at
+    once with `MultiSubnetFailover=true`, for an availability group listener in several subnets: the first to
+    answer is used and the others are cancelled. Azure SQL's gateway redirect is followed.
+  - A transient login error (an Azure SQL database starting, paused or moving: 4060, 40613, 40197, …) is tried
+    again `ConnectRetryCount` times (1 by default), `ConnectRetryInterval` apart (10 s).
+  - Each attempt is bounded by the connect timeout (15 s).
 - **Encryption.**
   - `Encrypt=true` (the default) encrypts the whole session, with the TLS handshake carried in PRELOGIN packets.
   - `Encrypt=false` encrypts the login only (or nothing, if the server cannot).
@@ -345,7 +351,8 @@ result set as tab-separated text, then the server's messages.
   - `await pool.warmUp()?` opens `Min Pool Size` connections ahead of need. `Connection Lifetime` sets how long a
     connection is reused (an hour by default; 0 for no limit).
   - A connection that failed, is mid-stream, has a transaction open, or is past its lifetime (an hour) is dropped
-    instead of reused. One idle over five minutes is replaced.
+    instead of reused. One idle over five minutes is replaced, and so is one the server closed while it sat in the
+    pool (a restart, a failover, a `KILL`): `isAlive()` finds that without waiting, and the lease gets a new one.
   - A reused connection's session is reset with its next request (TDS's RESETCONNECTION flag:
     temporary tables, `SET` options and the isolation level as new).
 - **Table-valued parameters and bulk copy.** `MsSqlTable` holds typed columns and rows. `params.table(type, rows)`
@@ -383,6 +390,8 @@ Bugs and bottlenecks in the C# driver that this port does not carry over:
   CeeSafe has no reflection; read cells with the typed getters.
 - Kerberos and Entra ID (Azure AD) logins, Always Encrypted, MARS, the UTF-8 feature extension, and the
   double-byte code pages (932, 936, 949, 950) for `varchar` (they read as U+FFFD past ASCII).
+- Session recovery: a connection outside a pool that the server closes while idle fails its next call (`Closed` or
+  `Io`) instead of reconnecting with its session restored. A pool replaces such connections.
 - MySQL and Oracle: CosmoSQLClient's other drivers are for separate packages.
 
 ## Tests
@@ -404,7 +413,8 @@ The live tests (checked against SQL Server 2025) cover:
 - every type each way, injection-shaped text, and 10 MB values;
 - multiple result sets, `PRINT`, procedures with output parameters and a return status, and `sp_executesql` outputs;
 - errors mid-result, transactions, and 200,000 streamed rows with an early cancel;
-- a command timeout answered by an attention, the pool's session reset and warm-up, and `FOR JSON`;
+- a command timeout answered by an attention, the pool's session reset and warm-up, a pooled connection replaced
+  after a `KILL`, transient login errors retried, and `FOR JSON`;
 - table-valued parameters and bulk copies of fourteen column types, NULLs, defaults, 20,000 rows, and a refused load.
 
 ## Benchmarks

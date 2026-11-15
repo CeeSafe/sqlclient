@@ -192,55 +192,80 @@ public struct MsSqlConnection {
 
     // ---- Connecting ----
 
-    /// Connects, agrees on encryption, and logs in, within the connect timeout. Every address the host resolves to
-    /// is tried in order. A named instance without a port is looked up through SQL Server Browser; a redirect from
-    /// the server (Azure SQL's gateway) is followed once.
+    /// Connects, agrees on encryption, and logs in, within the connect timeout. A host's addresses are tried in
+    /// order, or all at once with `MultiSubnetFailover`. A named instance without a port is looked up through SQL
+    /// Server Browser; a redirect from the server (Azure SQL's gateway) is followed once. A transient login error
+    /// (an Azure SQL database starting, paused or moving: 4060, 40613, …) is tried again up to `ConnectRetryCount`
+    /// times, `ConnectRetryInterval` apart, each attempt with the whole connect timeout.
     public async fn connect(config: borrow MsSqlConfig) -> Result<MsSqlConnection, MsSqlError> {
-        let ms = config.connectTimeout();
-        if (ms == 0) {
-            return await MsSqlConnection.open(config);
+        var attempt: u8 = 0;
+        loop {
+            var transient = false;
+            let ms = config.connectTimeout();
+            let outcome = if (ms == 0) await MsSqlConnection.open(config, mut transient)
+                else await Async.timeout(
+                    ms,
+                    MsSqlError.TimedOut,
+                    async () => await MsSqlConnection.open(config, mut transient),
+                );
+            match (outcome) {
+                Ok(c) => { return Ok(c); }
+                Err(e) => {
+                    if (!transient || attempt >= config.connectRetryCount()) {
+                        return Err(e);
+                    }
+                }
+            }
+            attempt += 1;
+            ioResult(await Timer.sleep(config.connectRetryInterval()))?;
         }
-        return await Async.timeout(ms, MsSqlError.TimedOut, async () => await MsSqlConnection.open(config));
     }
 
-    async fn open(config: borrow MsSqlConfig) -> Result<MsSqlConnection, MsSqlError> {
+    async fn open(config: borrow MsSqlConfig, transient: borrow mut bool) -> Result<MsSqlConnection, MsSqlError> {
         var port = config.port();
         if (port == 0) {
             port = await browseInstancePort(config.host(), config.instance())?;
         }
-        var connection = await MsSqlConnection.openAt(config, config.host(), port)?;
+        var connection = await MsSqlConnection.openAt(config, config.host(), port, transient)?;
         if (connection.routeHost.length == 0) {
             return Ok(connection);
         }
         // Routed: log in again where the server says.
         let host = replace(mut connection.routeHost, String.create());
         let routedPort = connection.routePort;
-        var routed = await MsSqlConnection.openAt(config, host.view(), routedPort)?;
+        var routed = await MsSqlConnection.openAt(config, host.view(), routedPort, transient)?;
         routed.routeHost.clear();
         return Ok(routed);
     }
 
-    async fn openAt(config: borrow MsSqlConfig, host: StringView, port: u16) -> Result<MsSqlConnection, MsSqlError> {
-        let addresses = match (await AsyncDns.resolve(host, port)) {
+    async fn openAt(
+        config: borrow MsSqlConfig,
+        host: StringView,
+        port: u16,
+        transient: borrow mut bool,
+    ) -> Result<MsSqlConnection, MsSqlError> {
+        let resolved = match (await AsyncDns.resolve(host, port)) {
             Ok(a) => a,
             Err(e) => { return Err(MsSqlError.Io(e)); }
         };
-        var failure = MsSqlError.Closed;
-        for (address in preferred(addresses.view(), config.addressPreference())?.view()) {
-            match (await AsyncTcpStream.connectTo(address)) {
-                Ok(tcp) => {
-                    match (tcp.setNoDelay(true)) {
-                        Ok() => {}
-                        Err(_) => {}
-                    }
-                    var connection = MsSqlConnection.over(tcp, config.commandTimeout())?;
-                    await connection.login(config, host)?;
-                    return Ok(connection);
+        let addresses = preferred(resolved.view(), config.addressPreference())?;
+        let tcp = if (config.multiSubnetFailover() && addresses.length > 1) await connectAny(addresses.view())?
+            else await connectFirst(addresses.view())?;
+        match (tcp.setNoDelay(true)) {
+            Ok() => {}
+            Err(_) => {}
+        }
+        var connection = MsSqlConnection.over(tcp, config.commandTimeout())?;
+        match (await connection.login(config, host)) {
+            Ok() => { return Ok(connection); }
+            Err(e) => {
+                match (connection.lastError()) {
+                    Some(m) => { *transient = isTransient(m.number); }
+                    null => {}
                 }
-                Err(e) => { failure = MsSqlError.Io(e); }
+                return Err(e);
             }
         }
-        return Err(failure);
     }
 
     fn over(tcp: AsyncTcpStream, commandMillis: u64) -> Result<MsSqlConnection, MsSqlError> {
@@ -1550,6 +1575,19 @@ public struct MsSqlConnection {
     /// login's "changed database context".
     public fn messages(borrow this) -> Slice<MsSqlMessage> => this.infoList.view();
 
+    /// Whether the server still holds this idle connection: one the server, a failover or a middlebox closed has
+    /// its end of stream (or a reset) waiting, which a read finds at once. It never waits; it is false while an
+    /// operation is under way or after one failed.
+    public async fn isAlive(borrow mut this) -> bool {
+        if (!this.isReady() || this.inStart != this.inEnd) {
+            return false;
+        }
+        var one = [0u8; 1];
+        let probe = await Async.timeout(0, AsyncError.TimedOut, async () => await this.tcp.read(mut one[..]));
+        // Nothing to read is a live connection; an end, an error, or bytes nobody asked for are not.
+        return probe is Err(AsyncError.TimedOut);
+    }
+
     /// Whether the connection can take another operation: not broken, and no streamed query unfinished.
     public fn isReady(borrow this) -> bool => !this.busy && this.stream == S_IDLE;
 
@@ -1709,4 +1747,65 @@ fn preferred(
         }
     }
     return Ok(ordered);
+}
+
+/// Login errors that pass: an Azure SQL database starting, resuming, failing over or short of resources
+/// (SqlClient's list, and 4060 for a database not yet open).
+fn isTransient(number: u32) -> bool =>
+    number == 4060 || number == 4221 || number == 10928 || number == 10929 || number == 40197 || number == 40501 ||
+        number == 40613 || number == 42108 || number == 42109 || number == 49918 || number == 49919 || number == 49920;
+
+/// The first of `addresses` that accepts a connection, tried in order.
+async fn connectFirst(addresses: Slice<SocketAddress>) -> Result<AsyncTcpStream, MsSqlError> {
+    var failure = MsSqlError.Closed;
+    for (address in addresses) {
+        match (await AsyncTcpStream.connectTo(address)) {
+            Ok(tcp) => { return Ok(tcp); }
+            Err(e) => { failure = MsSqlError.Io(e); }
+        }
+    }
+    return Err(failure);
+}
+
+/// How a parallel connect's children end: one connected (which stops the rest), or no memory for a child.
+enum MsRace {
+    Won,
+    OutOfMemory,
+}
+
+/// The first of `addresses` to accept a connection, all tried at once (MultiSubnetFailover). The first to connect
+/// sends its stream and ends the scope with `Won`, which cancels the others; a failure sends its error.
+async fn connectAny(addresses: Slice<SocketAddress>) -> Result<AsyncTcpStream, MsSqlError> {
+    let results = match (Channel<Result<AsyncTcpStream, AsyncError>>.create(addresses.length)) {
+        Ok(c) => c,
+        Err(_) => { return Err(MsSqlError.OutOfMemory); }
+    };
+    let outcome = await Async.scope(MsRace.OutOfMemory, (s) => {
+        for (address in addresses) {
+            let sink = borrow results;
+            s.spawn(async move () => {
+                match (await AsyncTcpStream.connectTo(address)) {
+                    Ok(tcp) => {
+                        let _ = sink.trySend(Ok(tcp));
+                        return Err(MsRace.Won);
+                    }
+                    Err(e) => {
+                        let _ = sink.trySend(Err(e));
+                        return Ok();
+                    }
+                }
+            });
+        }
+    });
+    if (outcome is Err(MsRace.OutOfMemory)) {
+        return Err(MsSqlError.OutOfMemory);
+    }
+    var failure = MsSqlError.Closed;
+    loop {
+        match (results.tryRecv()) {
+            Some(Ok(tcp)) => { return Ok(tcp); }
+            Some(Err(e)) => { failure = MsSqlError.Io(e); }
+            null => { return Err(failure); }
+        }
+    }
 }

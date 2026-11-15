@@ -57,6 +57,9 @@ public struct MsSqlConfig {
     /// `Connection Lifetime`, when given; else the pool's default.
     private lifetimeMillis: u64?;
     private addressOrder: MsAddressPreference;
+    private parallelConnect: bool;
+    private retryCount: u8;
+    private retryMillis: u64;
     private tlsConfig: TlsConfig?;
 
     fn empty() -> MsSqlConfig => MsSqlConfig {
@@ -82,6 +85,9 @@ public struct MsSqlConfig {
         minPool: 0,
         lifetimeMillis: null,
         addressOrder: MsAddressPreference.PlatformDefault,
+        parallelConnect: false,
+        retryCount: 1,
+        retryMillis: 10000,
         tlsConfig: null,
     };
 
@@ -116,7 +122,8 @@ public struct MsSqlConfig {
     /// `false`, `yes`, `no`, `mandatory`, `optional`, `strict`), `TrustServerCertificate`, `HostNameInCertificate`,
     /// `Application Name` (`App`), `Workstation ID` (`WSID`), `Current Language` (`Language`), `Connect Timeout`
     /// (`Connection Timeout`, `Timeout`) and `Command Timeout` in seconds, `Packet Size`, `ApplicationIntent`
-    /// (`ReadOnly`, `ReadWrite`), `Max Pool Size`, `Min Pool Size`, `Connection Lifetime` and `IPAddressPreference`.
+    /// (`ReadOnly`, `ReadWrite`), `Max Pool Size`, `Min Pool Size`, `Connection Lifetime`, `IPAddressPreference`,
+    /// `MultiSubnetFailover`, `ConnectRetryCount` and `ConnectRetryInterval`.
     /// Spaces in keys do not matter. ADO.NET's other keys are accepted where they change nothing here (`Pooling`,
     /// `Enlist`, `Persist Security Info`, …) and `Unsupported` where they ask for what this client lacks
     /// (`MultipleActiveResultSets=true`, `Column Encryption Setting=Enabled`, `Failover Partner`, …);
@@ -442,8 +449,29 @@ public struct MsSqlConfig {
             return Err(MsSqlError.Config);
         }
         // Booleans whose `true` asks for something this client does not do.
-        if (isKey(key, "multiple active result sets") || isKey(key, "mars") || isKey(key, "multi subnet failover") ||
-            isKey(key, "user instance") || isKey(key, "context connection") || isKey(key, "replication")) {
+        if (isKey(key, "multi subnet failover")) {
+            this.parallelConnect = parseBool(value)?;
+            return Ok();
+        }
+        if (isKey(key, "connect retry count")) {
+            this.retryCount = checkedTruncate<u8>(value.parseInt<u32>() ?? 256) ?? { return Err(MsSqlError.Config); };
+            return Ok();
+        }
+        if (isKey(key, "connect retry interval")) {
+            let seconds = value.parseInt<u64>() ?? 0;
+            if (seconds < 1 || seconds > 60) {
+                return Err(MsSqlError.Config);
+            }
+            this.retryMillis = seconds * 1000;
+            return Ok();
+        }
+        if (isKey(
+            key,
+            "multiple active result sets",
+        ) || isKey(
+            key,
+            "mars",
+        ) || isKey(key, "user instance") || isKey(key, "context connection") || isKey(key, "replication")) {
             if (parseBool(value)?) {
                 return Err(MsSqlError.Unsupported);
             }
@@ -610,6 +638,14 @@ public struct MsSqlConfig {
     /// `Connection Lifetime` (`Load Balance Timeout`) in milliseconds, when given: the age at which a pool closes a
     /// connection as its lease ends (0: never).
     public fn connectionLifetime(borrow this) -> u64? => this.lifetimeMillis;
+    /// `MultiSubnetFailover`: every address of the host is tried at once and the first to answer is used, as an
+    /// availability group listener in several subnets needs.
+    public fn multiSubnetFailover(borrow this) -> bool => this.parallelConnect;
+    /// `ConnectRetryCount` (1 by default, 0 to 255): how many times `connect` tries again after a transient login
+    /// error, such as an Azure SQL database still starting.
+    public fn connectRetryCount(borrow this) -> u8 => this.retryCount;
+    /// `ConnectRetryInterval` in milliseconds (10 s by default, 1 to 60 s): the wait before each retry.
+    public fn connectRetryInterval(borrow this) -> u64 => this.retryMillis;
     /// `IPAddressPreference`: which of a host's addresses are tried first.
     public fn addressPreference(borrow this) -> MsAddressPreference => this.addressOrder;
     /// The name the server's certificate must carry: `HostNameInCertificate`, else the host.

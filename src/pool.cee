@@ -34,7 +34,7 @@ fn emptySlot() -> MsPoolSlot => MsPoolSlot { connection: Vector<MsSqlConnection>
 /// - a transaction is still open on it;
 /// - it is older than the pool's lifetime.
 /// Such a connection is dropped and its slot reopened on demand. A connection idle longer than the idle limit is
-/// replaced when next taken. A connection taken again has its session reset with its next request (temporary
+/// replaced when next taken, and so is one the server closed meanwhile. A connection taken again has its session reset with its next request (temporary
 /// tables, `SET` options and the isolation level are those of a new session), as ADO.NET's pool does.
 @noncopy
 public struct MsSqlPool {
@@ -132,6 +132,10 @@ public struct MsSqlPool {
         }
         // The lease owns the slot from here, so a failed or cancelled connect gives it back through the drop.
         var lease = MsSqlLease { slot: slot, home: this.slots.clone(), lifetimeMillis: this.lifetimeMillis };
+        // A connection the server closed while it was idle (a restart, a failover, a KILL) is replaced, unseen.
+        if (lease.slot.connection.length > 0 && !await lease.slot.connection[0].isAlive()) {
+            lease.slot.connection.clear();
+        }
         if (lease.slot.connection.length == 0) {
             let connection = await MsSqlConnection.connect(borrow this.settings)?;
             allocated(lease.slot.connection.push(connection))?;

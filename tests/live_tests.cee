@@ -1038,6 +1038,95 @@ fn tableParametersAndBulkCopyWork() -> Result<void, TestFailure> {
     return report(Async.run(tablesAndBulk(config)));
 }
 
+async fn killed(pool: borrow MsSqlPool, config: borrow MsSqlConfig) -> Outcome {
+    let none = MsSqlParams.create();
+    var first: i64 = 0;
+    var loggedIn = String.create();
+    let who = "SELECT @@SPID, CONVERT(nvarchar(40), login_time, 121) FROM sys.dm_exec_sessions WHERE session_id = @@SPID";
+    {
+        var lease = match (await pool.acquire()) {
+            Ok(l) => l,
+            Err(e) => { return connectFailed(e); }
+        };
+        if (!await lease.connection().isAlive()) {
+            return wrong("an idle connection is alive");
+        }
+        match (await lease.connection().query(who, none)) {
+            Ok(r) => {
+                first = r.int64(0, 0) ?? 0;
+                let _ = loggedIn.append(r.text(0, 1) ?? "");
+            }
+            Err(e) => { return failed(e, lease.connection()); }
+        }
+    }
+    // Another session ends the pooled one, as a restart or failover would.
+    var admin = match (await MsSqlConnection.connect(config)) {
+        Ok(c) => c,
+        Err(e) => { return connectFailed(e); }
+    };
+    var kill = String.create();
+    let _ = kill.append("KILL ");
+    let _ = kill.appendNumber(first);
+    match (await admin.batch(kill.view())) {
+        Ok(_) => {}
+        Err(e) => { return failed(e, admin); }
+    }
+    let _ = await Timer.sleep(500);
+    var lease = match (await pool.acquire()) {
+        Ok(l) => l,
+        Err(e) => { return connectFailed(e); }
+    };
+    match (await lease.connection().query(who, none)) {
+        Ok(r) => {
+            // SQL Server reuses session ids, so a new session is told by its login time.
+            if (r.int64(0, 0) == Some(first) && r.text(0, 1) == Some(loggedIn.view())) {
+                return wrong("a new session");
+            }
+        }
+        Err(e) => { return failed(e, lease.connection()); }
+    }
+    return passed();
+}
+
+@test
+fn poolReplacesAKilledConnection() -> Result<void, TestFailure> {
+    let config = match (testConfig()) {
+        Some(c) => c,
+        null => { return Ok(); }
+    };
+    let pool = MsSqlPool.create(testConfig()!, 1)!;
+    return report(Async.run(killed(pool, config)));
+}
+
+async fn retried(text: StringView, retries: StringView) -> Result<u64, MsSqlError> {
+    var full = String.create();
+    let _ = full.append(text);
+    let _ = full.append(";Database=sqlclient_no_such_database;ConnectRetryInterval=1;ConnectRetryCount=");
+    let _ = full.append(retries);
+    let config = MsSqlConfig.parse(full.view())?;
+    let started = Clock.monotonicNanos();
+    match (await MsSqlConnection.connect(config)) {
+        Ok(_) => { return Err(MsSqlError.Protocol); }
+        Err(MsSqlError.Login) => {}
+        Err(e) => { return Err(e); }
+    }
+    return Ok((Clock.monotonicNanos() - started) / 1000000);
+}
+
+@test
+fn transientLoginErrorsAreRetried() -> Result<void, TestFailure> {
+    let text = match (Environment.variable("MSSQL_TEST_CONNECTION")) {
+        Some(t) => t,
+        null => { return Ok(); }
+    };
+    // A database that does not exist is error 4060, which Azure SQL also gives while a database starts.
+    let once = Async.run(retried(text, "0"));
+    let twice = Async.run(retried(text, "2"));
+    Check.isTrue(once.isOk() && twice.isOk(), "both refused as a login")?;
+    Check.isTrue(twice! >= 2000 && twice! >= once! + 1900, "two retries, a second apart")?;
+    return Ok();
+}
+
 async fn json(config: borrow MsSqlConfig) -> Outcome {
     var db = match (await MsSqlConnection.connect(config)) {
         Ok(c) => c,

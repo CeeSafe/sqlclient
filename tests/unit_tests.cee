@@ -627,3 +627,53 @@ fn tableValuesFitTheirColumns() -> Result<void, TestFailure> {
     Check.isTrue(p.table("dbo.T", t).isErr(), "a partial row")?;
     return Ok();
 }
+
+// ── Connecting to several addresses ──────────────────────────────────────────────────────────────────────────
+
+async fn parallelConnect(open: u16, closed: u16) -> Result<void, TestFailure> {
+    // An address that never answers (a non-routed one) first, then one that listens: in parallel the second wins
+    // at once, where trying them in order would wait out the first.
+    let addresses = [SocketAddress.V4([10u8, 255, 255, 1], 9), SocketAddress.V4([127u8, 0, 0, 1], open)];
+    let started = Clock.monotonicNanos();
+    let won = await Async.timeout(3000, MsSqlError.TimedOut, async () => await connectAny(addresses[..]));
+    Check.isTrue(won.isOk(), "the listening address wins")?;
+    Check.isTrue(Clock.monotonicNanos() - started < 2000000000, "without waiting for the silent one")?;
+    let refused = [SocketAddress.V4([127u8, 0, 0, 1], closed), SocketAddress.V4([127u8, 0, 0, 1], closed)];
+    Check.isTrue((await connectAny(refused[..])).isErr(), "every address refused")?;
+    return Ok();
+}
+
+fn portOf(listener: borrow AsyncTcpListener) -> u16 {
+    return match (listener.localAddress()!) {
+        SocketAddress.V4(_, port) => port,
+        SocketAddress.V6(_, port, _) => port,
+    };
+}
+
+@test
+fn multiSubnetFailoverTakesTheFirstToAnswer() -> Result<void, TestFailure> {
+    let listener = AsyncTcpListener.bind("127.0.0.1", 0)!;
+    let open = portOf(listener);
+    var closed: u16 = 0;
+    {
+        let gone = AsyncTcpListener.bind("127.0.0.1", 0)!;
+        closed = portOf(gone);
+    }
+    return Async.run(parallelConnect(open, closed));
+}
+
+@test
+fn retryKeysParse() -> Result<void, TestFailure> {
+    let c = MsSqlConfig.parse("Server=a;MultiSubnetFailover=True;ConnectRetryCount=3;ConnectRetryInterval=5")!;
+    Check.isTrue(c.multiSubnetFailover(), "parallel")?;
+    Check.equalU64(3, c.connectRetryCount() as u64)?;
+    Check.equalU64(5000, c.connectRetryInterval())?;
+    let plain = MsSqlConfig.parse("Server=a")!;
+    Check.isTrue(!plain.multiSubnetFailover(), "in order by default")?;
+    Check.equalU64(1, plain.connectRetryCount() as u64)?;
+    Check.equalU64(10000, plain.connectRetryInterval())?;
+    Check.equalText("config", parseOutcome("Server=a;ConnectRetryCount=256"))?;
+    Check.equalText("config", parseOutcome("Server=a;ConnectRetryInterval=0"))?;
+    Check.equalText("config", parseOutcome("Server=a;ConnectRetryInterval=61"))?;
+    return Ok();
+}
