@@ -1,6 +1,7 @@
 // A tour of sqlclient: each function is one of README.md's examples, run in order against a real server.
 // Usage: MSSQL_CONNECTION="Server=db,1433;Database=test;User Id=…;Password=…;TrustServerCertificate=true" out/tour
-// It works in temporary tables (#…) only, so it leaves nothing behind.
+// It works in temporary tables (#…), and drops the one table type it creates, so it leaves nothing behind.
+import sqlclient.MsBulkOptions;
 import sqlclient.MsDateTime;
 import sqlclient.MsDecimal;
 import sqlclient.MsGuid;
@@ -12,6 +13,7 @@ import sqlclient.MsSqlErrors;
 import sqlclient.MsSqlParams;
 import sqlclient.MsSqlPool;
 import sqlclient.MsSqlRows;
+import sqlclient.MsSqlTable;
 import sqlclient.MsSqlType;
 
 async fn say(text: StringView) {
@@ -197,6 +199,49 @@ async fn resultSets(db: borrow mut MsSqlConnection) -> Result<void, MsSqlError> 
     return Ok();
 }
 
+/// A table-valued parameter: many values in one parameter, joined like a table.
+async fn tableParameter(db: borrow mut MsSqlConnection) -> Result<void, MsSqlError> {
+    await db.batch("IF TYPE_ID('dbo.tour_ids') IS NULL CREATE TYPE dbo.tour_ids AS TABLE (id int PRIMARY KEY)")?;
+    var ids = MsSqlTable.create();
+    ids.column("id", MsSqlType.Int)?;
+    for (id in 1..6) {
+        ids.int32(id * id)?;
+    }
+    var p = MsSqlParams.create();
+    p.table("dbo.tour_ids", ids)?;
+    let rows = await db.query("SELECT SUM(id) FROM @p1", p)?;
+    await sayNumber("sum of the squares 1..5: ", rows.int64(0, 0) ?? 0);
+    await db.batch("DROP TYPE dbo.tour_ids")?;
+    return Ok();
+}
+
+/// A bulk copy: 10,000 rows in one load.
+async fn bulkCopy(db: borrow mut MsSqlConnection) -> Result<void, MsSqlError> {
+    await db.batch(
+        "CREATE TABLE #events (id int NOT NULL PRIMARY KEY, kind nvarchar(20) NOT NULL, at datetime2(7), amount decimal(12,2))",
+    )?;
+    var rows = MsSqlTable.create();
+    rows.column("id", MsSqlType.Int)?;
+    rows.textColumn("kind", 20)?;
+    rows.column("at", MsSqlType.DateTime2)?;
+    rows.decimalColumn("amount", 12, 2)?;
+    for (k in 0..10000) {
+        rows.int32(k)?;
+        rows.text(if (k % 2 == 0) "click" else "view")?;
+        rows.dateTime(MsDateTime.of(2026, 11, 15, 12, 0, 0, 0))?;
+        if (k % 10 == 0) {
+            rows.nullValue()?;
+        } else {
+            rows.decimal(MsDecimal.ofInt(k as i64, 1))?; // k / 10, rescaled to two places
+        }
+    }
+    var options = MsBulkOptions.defaults();
+    options.tableLock = true;
+    let loaded = await db.bulkInsert("#events", rows, options)?;
+    await sayNumber("rows bulk loaded: ", truncate<i64>(loaded));
+    return Ok();
+}
+
 /// A statement over the command timeout: the server stops it, and the connection stays usable.
 async fn timeouts(db: borrow mut MsSqlConnection) -> Result<void, MsSqlError> {
     db.setCommandTimeout(1000);
@@ -260,6 +305,10 @@ async fn run(text: StringView) -> Result<void, MsSqlError> {
     await procedures(mut db)?;
     await say("\n-- result sets\n");
     await resultSets(mut db)?;
+    await say("\n-- table-valued parameter\n");
+    await tableParameter(mut db)?;
+    await say("\n-- bulk copy\n");
+    await bulkCopy(mut db)?;
     await say("\n-- timeouts\n");
     await timeouts(mut db)?;
     await db.close()?;

@@ -778,6 +778,266 @@ fn poolReusesAndResets() -> Result<void, TestFailure> {
     return report(Async.run(pooled(pool)));
 }
 
+async fn warmed(pool: borrow MsSqlPool) -> Outcome {
+    match (await pool.warmUp()) {
+        Ok(n) => {
+            if (n != 3) {
+                return wrong("Min Pool Size=3 opens three");
+            }
+        }
+        Err(e) => { return connectFailed(e); }
+    }
+    match (await pool.warmUp()) {
+        Ok(n) => {
+            if (n != 0) {
+                return wrong("a second warmUp opens none");
+            }
+        }
+        Err(e) => { return connectFailed(e); }
+    }
+    let none = MsSqlParams.create();
+    var lease = match (await pool.acquire()) {
+        Ok(l) => l,
+        Err(e) => { return connectFailed(e); }
+    };
+    match (await lease.connection().query("SELECT 1", none)) {
+        Ok(r) => {
+            if (r.int64(0, 0) != Some(1i64)) {
+                return wrong("a warmed connection answers");
+            }
+        }
+        Err(e) => { return failed(e, lease.connection()); }
+    }
+    return passed();
+}
+
+@test
+fn poolWarmsUpToMinPoolSize() -> Result<void, TestFailure> {
+    let text = match (Environment.variable("MSSQL_TEST_CONNECTION")) {
+        Some(t) => t,
+        null => { return Ok(); }
+    };
+    var full = String.create();
+    let _ = full.append(text);
+    let _ = full.append(";Min Pool Size=3;Max Pool Size=4;Connection Lifetime=600;IPAddressPreference=IPv4First");
+    let pool = MsSqlPool.fromConfig(MsSqlConfig.parse(full.view())!)!;
+    return report(Async.run(warmed(pool)));
+}
+
+/// Rows of every kind a table column can be: two full rows and one of NULLs.
+fn sampleRows() -> Result<MsSqlTable, MsSqlError> {
+    var t = MsSqlTable.create();
+    t.column("id", MsSqlType.Int)?;
+    t.column("big", MsSqlType.BigInt)?;
+    t.textColumn("name", 50)?;
+    t.textColumn("body", 0)?;
+    t.varcharColumn("code", 10)?;
+    t.decimalColumn("amount", 18, 2)?;
+    t.column("price", MsSqlType.Money)?;
+    t.column("flag", MsSqlType.Bit)?;
+    t.column("ratio", MsSqlType.Float)?;
+    t.column("tag", MsSqlType.UniqueIdentifier)?;
+    t.column("day", MsSqlType.Date)?;
+    t.column("at", MsSqlType.DateTime2)?;
+    t.column("zoned", MsSqlType.DateTimeOffset)?;
+    t.binaryColumn("blob", 0)?;
+    for (k in 1..3) {
+        t.int32(k)?;
+        t.int64(5000000000 * k as i64)?;
+        t.text(if (k == 1) "Zoë" else "second")?;
+        var body = String.create();
+        for (n in 0..3000) {
+            let _ = body.append("ab");
+        }
+        t.text(body.view())?;
+        t.text("ABC")?;
+        t.decimalText("12.5")?;                       // rescaled to 12.50
+        t.decimalText("3.1416")?;
+        t.bool(k == 1)?;
+        t.float64(0.25)?;
+        t.guid(MsGuid.parse("6f9619ff-8b86-d011-b42d-00c04fc964ff")!)?;
+        t.dateTime(MsDateTime.date(2026, 11, 15))?;
+        t.dateTime(MsDateTime.of(2026, 11, 15, 9, 30, 15, 1234500))?;
+        t.dateTime(MsDateTime.of(2026, 11, 15, 9, 30, 0, 0).withOffset(180))?;
+        let blob = [1u8, 2, 3];
+        t.bytes(blob[..])?;
+    }
+    for (c in 0..14) {
+        t.nullValue()?;
+    }
+    return Ok(t);
+}
+
+/// Checks the rows `sampleRows` gave, read back ordered by id with NULLs first.
+fn checkSample(r: borrow MsSqlRows) -> Outcome {
+    if (r.rowCount() != 3) {
+        return wrong("three rows");
+    }
+    for (c in 0..14) {
+        if (!r.isNull(0, c)) {
+            return wrong("the NULL row");
+        }
+    }
+    if (r.int64(1, 0) != Some(1i64) || r.int64(2, 1) != Some(10000000000i64) || r.text(1, 2) != Some("Zoë")) {
+        return wrong("ints and text");
+    }
+    if ((r.text(1, 3) ?? "").length != 6000 || r.text(1, 4) != Some("ABC")) {
+        return wrong("nvarchar(max) and varchar");
+    }
+    if (valueText(r, 1, 5).view() != "12.50" || valueText(r, 1, 6).view() != "3.1416") {
+        return wrong("decimal and money");
+    }
+    if (r.bool(1, 7) != Some(true) || r.bool(2, 7) != Some(false) || r.float64(1, 8) != Some(0.25)) {
+        return wrong("bit and float");
+    }
+    if (valueText(r, 1, 9).view() != "6F9619FF-8B86-D011-B42D-00C04FC964FF" && valueText(r, 1, 9).view() != "6f9619ff-8b86-d011-b42d-00c04fc964ff") {
+        return wrong("uniqueidentifier");
+    }
+    if (valueText(r, 1, 10).view() != "2026-11-15" || valueText(r, 1, 11).view() != "2026-11-15T09:30:15.0012345") {
+        return wrong("date and datetime2");
+    }
+    if (valueText(r, 1, 12).view() != "2026-11-15T09:30:00+03:00") {
+        return wrong("datetimeoffset");
+    }
+    let blob = r.bytes(1, 13) ?? [];
+    if (blob.length != 3 || blob[2] != 3) {
+        return wrong("varbinary(max)");
+    }
+    return passed();
+}
+
+async fn tablesAndBulk(config: borrow MsSqlConfig) -> Outcome {
+    var db = match (await MsSqlConnection.connect(config)) {
+        Ok(c) => c,
+        Err(e) => { return connectFailed(e); }
+    };
+    let columns = """
+        id int, big bigint, name nvarchar(50), body nvarchar(max), code varchar(10), amount decimal(18,2),
+        price money, flag bit, ratio float, tag uniqueidentifier, day date, at datetime2(7), zoned datetimeoffset(7),
+        blob varbinary(max)
+        """;
+    var setup = String.create();
+    let _ = setup.append("IF TYPE_ID('dbo.sqlclient_sample') IS NULL CREATE TYPE dbo.sqlclient_sample AS TABLE (");
+    let _ = setup.append(columns);
+    let _ = setup.append("); CREATE TABLE #loaded (");
+    let _ = setup.append(columns);
+    let _ = setup.append(", note nvarchar(20) DEFAULT N'default')");
+    match (await db.batch(setup.view())) {
+        Ok(_) => {}
+        Err(e) => { return failed(e, db); }
+    }
+    // A table-valued parameter, read back through sp_executesql.
+    var p = MsSqlParams.create();
+    match (sampleRows()) {
+        Ok(t) => {
+            match (p.table("dbo.sqlclient_sample", t)) {
+                Ok() => {}
+                Err(e) => { return failed(e, db); }
+            }
+        }
+        Err(e) => { return failed(e, db); }
+    }
+    match (await db.query("SELECT * FROM @p1 ORDER BY id", p)) {
+        Ok(r) => {
+            let outcome = checkSample(r);
+            if (outcome.error.isSome() || outcome.message.length > 0) {
+                return outcome;
+            }
+        }
+        Err(e) => { return failed(e, db); }
+    }
+    // An empty one.
+    var empty = MsSqlTable.create();
+    let _ = empty.column("id", MsSqlType.Int);
+    var q = MsSqlParams.create();
+    let _ = q.table("dbo.sqlclient_sample", empty);
+    match (await db.query("SELECT COUNT(*) FROM @p1", q)) {
+        Ok(_) => { return wrong("a table of one column for a type of fourteen"); }
+        Err(MsSqlError.Server) => {}
+        Err(e) => { return failed(e, db); }
+    }
+    // A bulk copy into a temporary table, inside a transaction.
+    let rows = match (sampleRows()) {
+        Ok(t) => t,
+        Err(e) => { return failed(e, db); }
+    };
+    match (await db.begin()) {
+        Ok() => {}
+        Err(e) => { return failed(e, db); }
+    }
+    match (await db.bulkInsert("#loaded", rows, MsBulkOptions.defaults())) {
+        Ok(n) => {
+            if (n != 3) {
+                return wrong("three rows loaded");
+            }
+        }
+        Err(e) => { return failed(e, db); }
+    }
+    match (await db.commit()) {
+        Ok() => {}
+        Err(e) => { return failed(e, db); }
+    }
+    let none = MsSqlParams.create();
+    match (await db.query("SELECT * FROM #loaded ORDER BY id", none)) {
+        Ok(r) => {
+            let outcome = checkSample(r);
+            if (outcome.error.isSome() || outcome.message.length > 0) {
+                return outcome;
+            }
+            if (r.text(1, 14) != Some("default")) {
+                return wrong("a column left out takes its default");
+            }
+        }
+        Err(e) => { return failed(e, db); }
+    }
+    // Many rows, and a constraint violation that leaves the connection usable.
+    var many = MsSqlTable.create();
+    let _ = many.column("id", MsSqlType.Int);
+    let _ = many.textColumn("name", 50);
+    for (k in 0..20000) {
+        let _ = many.int32(k);
+        let _ = many.text("bulk row");
+    }
+    match (await db.batch("CREATE TABLE #many (id int PRIMARY KEY, name nvarchar(50) NOT NULL)")) {
+        Ok(_) => {}
+        Err(e) => { return failed(e, db); }
+    }
+    var options = MsBulkOptions.defaults();
+    options.tableLock = true;
+    options.checkConstraints = true;
+    match (await db.bulkInsert("#many", many, options)) {
+        Ok(n) => {
+            if (n != 20000) {
+                return wrong("20,000 rows loaded");
+            }
+        }
+        Err(e) => { return failed(e, db); }
+    }
+    match (await db.bulkInsert("#many", many, options)) {
+        Ok(_) => { return wrong("duplicate keys refused"); }
+        Err(MsSqlError.Server) => {}
+        Err(e) => { return failed(e, db); }
+    }
+    match (await db.query("SELECT COUNT(*) FROM #many", none)) {
+        Ok(r) => {
+            if (r.int64(0, 0) != Some(20000i64)) {
+                return wrong("the failed load added nothing");
+            }
+        }
+        Err(e) => { return failed(e, db); }
+    }
+    return passed();
+}
+
+@test
+fn tableParametersAndBulkCopyWork() -> Result<void, TestFailure> {
+    let config = match (testConfig()) {
+        Some(c) => c,
+        null => { return Ok(); }
+    };
+    return report(Async.run(tablesAndBulk(config)));
+}
+
 async fn json(config: borrow MsSqlConfig) -> Outcome {
     var db = match (await MsSqlConnection.connect(config)) {
         Ok(c) => c,

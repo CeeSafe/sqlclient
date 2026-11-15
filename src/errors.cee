@@ -16,6 +16,9 @@ public enum MsSqlError {
     /// The login needs an authentication method this client does not have (NTLM without a user name and password,
     /// Kerberos, Entra ID).
     UnsupportedAuthentication,
+    /// The connection string asks for a feature this client does not have: MARS, Always Encrypted, a failover
+    /// partner, `ServerCertificate`, `AttachDBFilename`, a user instance, a transport other than TCP.
+    Unsupported,
     /// The server reported one or more errors; `MsSqlConnection.errors()` has them, `lastError()` the first. The
     /// connection is usable again.
     Server,
@@ -26,7 +29,8 @@ public enum MsSqlError {
     /// An earlier operation on this connection was cancelled or failed partway, so the stream is out of step: drop
     /// the connection (or try `recover()`).
     Broken,
-    /// A connection string could not be read, or a value in it, or a parameter, is out of range.
+    /// A connection string could not be read, has a key ADO.NET does not know, or a value in it, or a parameter, is
+    /// out of range.
     Config,
     /// A query, parameter or value is larger than the protocol allows.
     TooLarge,
@@ -54,6 +58,7 @@ public struct MsSqlErrors {
             MsSqlError.EncryptionRefused => { return "the server and the configuration disagree on encryption"; }
             MsSqlError.Login => { return "the server refused the login"; }
             MsSqlError.UnsupportedAuthentication => { return "unsupported authentication method"; }
+            MsSqlError.Unsupported => { return "the connection string asks for a feature this client does not have"; }
             MsSqlError.Server => { return "the server reported an error"; }
             MsSqlError.Protocol => { return "protocol error"; }
             MsSqlError.Closed => { return "the server closed the connection"; }

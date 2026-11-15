@@ -165,43 +165,51 @@ fn putParam(
     if (k == P_VARBINARY) {
         return putBytesValue(out, 0xA5, v, session, p.isNull);
     }
-    // The temporal types, from dateParts: days (4), 100 ns units (8), offset minutes (2).
-    let days = if (p.isNull) 0u64 else v.readLE<u32>(0) as u64;
-    let ticks = if (p.isNull) 0u64 else v.readLE<u64>(4);
-    let offset = if (p.isNull) 0i64 else v.readLE<i16>(12) as i64;
+    if (k == P_DATE || k == P_TIME || k == P_DATETIME2 || k == P_DATETIMEOFFSET || k == P_DATETIME) {
+        allocated(putTemporalTypeInfo(out, k))?;
+        return putTemporalValue(out, k, v, p.isNull);
+    }
+    if (k == P_TABLE) {
+        return putTableValue(out, params, p, session, scratch);
+    }
+    return Err(MsSqlError.Config);
+}
+
+/// The TYPE_INFO of a date or time kind: `date`, `time(7)`, `datetime2(7)`, `datetimeoffset(7)`, `datetime`.
+fn putTemporalTypeInfo(out: borrow mut Vector<u8>, k: u8) -> Result<void, AllocError> {
     if (k == P_DATE) {
-        allocated(out.push(0x28))?;
-        if (p.isNull) {
-            return allocated(out.push(0));
-        }
+        return out.push(0x28);
+    }
+    if (k == P_DATETIME) {
+        out.push(0x6F)?;
+        return out.push(8);
+    }
+    out.push(if (k == P_TIME) 0x29u8 else (if (k == P_DATETIME2) 0x2Au8 else 0x2Bu8))?;
+    return out.push(7);
+}
+
+/// A date or time value of kind `k`, from dateParts: days (4), 100 ns units (8), offset minutes (2).
+fn putTemporalValue(out: borrow mut Vector<u8>, k: u8, v: Slice<u8>, isNull: bool) -> Result<void, MsSqlError> {
+    if (isNull) {
+        return allocated(out.push(0));
+    }
+    let days = v.readLE<u32>(0) as u64;
+    let ticks = v.readLE<u64>(4);
+    let offset = v.readLE<i16>(12) as i64;
+    if (k == P_DATE) {
         allocated(out.push(3))?;
         return putLittle(out, days, 3);
     }
     if (k == P_TIME) {
-        allocated(out.push(0x29))?;
-        allocated(out.push(7))?;
-        if (p.isNull) {
-            return allocated(out.push(0));
-        }
         allocated(out.push(5))?;
         return putLittle(out, ticks, 5);
     }
     if (k == P_DATETIME2) {
-        allocated(out.push(0x2A))?;
-        allocated(out.push(7))?;
-        if (p.isNull) {
-            return allocated(out.push(0));
-        }
         allocated(out.push(8))?;
         putLittle(out, ticks, 5)?;
         return putLittle(out, days, 3);
     }
     if (k == P_DATETIMEOFFSET) {
-        allocated(out.push(0x2B))?;
-        allocated(out.push(7))?;
-        if (p.isNull) {
-            return allocated(out.push(0));
-        }
         // The wire holds UTC: local time minus the offset.
         let perDay: i64 = 864000000000;
         var utc = truncate<i64>(ticks) - offset * 600000000;
@@ -221,24 +229,16 @@ fn putParam(
         putLittle(out, truncate<u64>(day), 3)?;
         return allocated(out.pushLE(truncate<i16>(offset)));
     }
-    if (k == P_DATETIME) {
-        allocated(out.push(0x6F))?;
-        allocated(out.push(8))?;
-        if (p.isNull) {
-            return allocated(out.push(0));
-        }
-        // Days since 1900, then 1/300 seconds, rounded to the nearest.
-        var day = truncate<i64>(days) - DAYS_0001_TO_1900;
-        var t300 = (ticks * 3 + 50000) / 100000;
-        if (t300 >= 25920000) {
-            t300 -= 25920000;
-            day += 1;
-        }
-        allocated(out.push(8))?;
-        allocated(out.pushLE(truncate<i32>(day)))?;
-        return allocated(out.pushLE(truncate<u32>(t300)));
+    // datetime: days since 1900, then 1/300 seconds, rounded to the nearest.
+    var day = truncate<i64>(days) - DAYS_0001_TO_1900;
+    var t300 = (ticks * 3 + 50000) / 100000;
+    if (t300 >= 25920000) {
+        t300 -= 25920000;
+        day += 1;
     }
-    return Err(MsSqlError.Config);
+    allocated(out.push(8))?;
+    allocated(out.pushLE(truncate<i32>(day)))?;
+    return allocated(out.pushLE(truncate<u32>(t300)));
 }
 
 fn allocated2(outcome: Result<bool, AllocError>) -> Result<bool, MsSqlError> {
@@ -324,6 +324,9 @@ fn appendDeclarations(params: borrow MsSqlParams, out: borrow mut Vector<u8>) ->
             out.extend("datetimeoffset(7)".bytes())?;
         } else if (k == P_DATETIME) {
             out.extend("datetime".bytes())?;
+        } else if (k == P_TABLE) {
+            out.extend(v[8..])?; // the quoted type name
+            out.extend(" READONLY".bytes())?;
         }
         if (p.output) {
             out.extend(" output".bytes())?;
@@ -378,4 +381,350 @@ fn putProcedureCall(
         putParam(out, params, p, session, mut scratch)?;
     }
     return Ok();
+}
+
+// ---- Rows: table-valued parameters (MS-TDS 2.2.5.5.5) and bulk loads (2.2.6.1) ----
+
+/// The packet type of a bulk load's rows.
+const PKT_BULK_LOAD: u8 = 0x07;
+
+/// The TYPE_INFO of column `c`.
+fn putColumnTypeInfo(out: borrow mut Vector<u8>, c: MsTableColumn, session: SessionText) -> Result<void, AllocError> {
+    let k = c.kind;
+    if (k == P_BIGINT || k == P_INT || k == P_SMALLINT || k == P_TINYINT) {
+        out.push(0x26)?;
+        return out.push(if (k == P_BIGINT) 8u8 else (if (k == P_INT) 4u8 else (if (k == P_SMALLINT) 2u8 else 1u8)));
+    }
+    if (k == P_BIT) {
+        out.push(0x68)?;
+        return out.push(1);
+    }
+    if (k == P_FLOAT || k == P_REAL) {
+        out.push(0x6D)?;
+        return out.push(if (k == P_FLOAT) 8u8 else 4u8);
+    }
+    if (k == P_GUID) {
+        out.push(0x24)?;
+        return out.push(16);
+    }
+    if (k == P_MONEY) {
+        out.push(0x6E)?;
+        return out.push(8);
+    }
+    if (k == P_DECIMAL) {
+        out.push(0x6A)?;
+        out.push(decimalSize(c.precision))?;
+        out.push(c.precision)?;
+        return out.push(c.scale);
+    }
+    if (k == P_NVARCHAR || k == P_VARCHAR || k == P_VARBINARY) {
+        out.push(if (k == P_NVARCHAR) 0xE7u8 else (if (k == P_VARCHAR) 0xA7u8 else 0xA5u8))?;
+        let bytes = if (k == P_NVARCHAR) c.length * 2 else c.length;
+        out.pushLE(if (c.length == 0) 0xFFFFu16 else truncate<u16>(bytes))?;
+        if (k != P_VARBINARY) {
+            out.extend(session.collation[..])?;
+        }
+        return Ok();
+    }
+    return putTemporalTypeInfo(out, k);
+}
+
+/// The fixed-length type of a kind that has one (INT1/2/4/8, BIT, FLT4/8, MONEY, DATETIME), else 0.
+fn fixedType(k: u8) -> u8 {
+    if (k == P_TINYINT) {
+        return 0x30;
+    }
+    if (k == P_SMALLINT) {
+        return 0x34;
+    }
+    if (k == P_INT) {
+        return 0x38;
+    }
+    if (k == P_BIGINT) {
+        return 0x7F;
+    }
+    if (k == P_BIT) {
+        return 0x32;
+    }
+    if (k == P_REAL) {
+        return 0x3B;
+    }
+    if (k == P_FLOAT) {
+        return 0x3E;
+    }
+    if (k == P_MONEY) {
+        return 0x3C;
+    }
+    if (k == P_DATETIME) {
+        return 0x3D;
+    }
+    return 0;
+}
+
+/// The bytes a `decimal(precision, s)` value takes on the wire: its sign, then 4, 8, 12 or 16 bytes.
+fn decimalSize(precision: u8) -> u8 =>
+    if (precision <= 9) 5u8 else (if (precision <= 19) 9u8 else (if (precision <= 28) 13u8 else 17u8));
+
+/// A value `v` (as `MsSqlParams` keeps it) in column `c`.
+fn putColumnValue(
+    out: borrow mut Vector<u8>,
+    c: MsTableColumn,
+    v: Slice<u8>,
+    isNull: bool,
+    session: SessionText,
+    scratch: borrow mut Vector<u8>,
+) -> Result<void, MsSqlError> {
+    let k = c.kind;
+    if (k == P_BIGINT || k == P_INT || k == P_SMALLINT || k == P_TINYINT || k == P_BIT || k == P_FLOAT ||
+        k == P_REAL || k == P_GUID) {
+        if (isNull) {
+            return allocated(out.push(0));
+        }
+        allocated(out.push(truncate<u8>(v.length)))?;
+        return allocated(out.extend(v));
+    }
+    if (k == P_MONEY) {
+        if (isNull) {
+            return allocated(out.push(0));
+        }
+        let units = truncate<u64>(v.readLE<i64>(0));
+        allocated(out.push(8))?;
+        allocated(out.pushLE(truncate<u32>(units >> 32)))?;
+        return allocated(out.pushLE(truncate<u32>(units)));
+    }
+    if (k == P_DECIMAL) {
+        if (isNull) {
+            return allocated(out.push(0));
+        }
+        let size = decimalSize(c.precision) as usize;
+        allocated(out.push(truncate<u8>(size)))?;
+        return allocated(out.extend(v[0..size])); // the sign, then the magnitude's low bytes
+    }
+    if (k == P_NVARCHAR || k == P_VARCHAR || k == P_VARBINARY) {
+        var bytes = v;
+        if (k == P_NVARCHAR) {
+            scratch.clear();
+            if (!isNull) {
+                allocated(Utf16.encode(StringView.fromUtf8(v) ?? "", scratch))?;
+            }
+            bytes = scratch.view();
+        } else if (k == P_VARCHAR) {
+            scratch.clear();
+            if (!isNull && !allocated2(CodePages.encode(session.codePage, v, scratch))?) {
+                return Err(MsSqlError.Config); // a character the server's code page cannot hold
+            }
+            bytes = scratch.view();
+        }
+        if (c.length == 0) {
+            // (max): PLP chunks, NULL as all ones.
+            if (isNull) {
+                return allocated(out.pushLE(0xFFFFFFFFFFFFFFFFu64));
+            }
+            if (bytes.length > 0x7FFFFFFF) {
+                return Err(MsSqlError.TooLarge);
+            }
+            // PLP_UNKNOWN_LEN, as SqlClient sends: SQL Server's bulk load reads a PLP value with a known total
+            // length as if more followed ("premature end-of-message"), so rows always give an unknown one.
+            allocated(out.pushLE(0xFFFFFFFFFFFFFFFEu64))?;
+            if (bytes.length > 0) {
+                allocated(out.pushLE(truncate<u32>(bytes.length)))?;
+                allocated(out.extend(bytes))?;
+            }
+            return allocated(out.pushLE(0u32));
+        }
+        if (isNull) {
+            return allocated(out.pushLE(0xFFFFu16));
+        }
+        let limit = if (k == P_NVARCHAR) c.length as usize * 2 else c.length as usize;
+        if (bytes.length > limit) {
+            return Err(MsSqlError.TooLarge);
+        }
+        allocated(out.pushLE(truncate<u16>(bytes.length)))?;
+        return allocated(out.extend(bytes));
+    }
+    return putTemporalValue(out, k, v, isNull);
+}
+
+/// Every row of `table`, each after `rowToken`, its values in column order.
+fn putRows(
+    out: borrow mut Vector<u8>,
+    table: borrow MsSqlTable,
+    rowToken: u8,
+    session: SessionText,
+    scratch: borrow mut Vector<u8>,
+) -> Result<void, MsSqlError> {
+    let columns = table.columnList();
+    let cells = table.cellList();
+    var i: usize = 0;
+    for (cell in cells.entryList()) {
+        if (i == 0) {
+            allocated(out.push(rowToken))?;
+        }
+        putColumnValue(out, columns[i], cells.valueOf(cell), cell.isNull, session, scratch)?;
+        i += 1;
+        if (i == columns.length) {
+            i = 0;
+        }
+    }
+    return Ok();
+}
+
+/// A B_VARCHAR: a count of UTF-16 code units in one byte, then UTF-16.
+fn putBVarchar(out: borrow mut Vector<u8>, text: Slice<u8>) -> Result<void, MsSqlError> => putParamName(out, text);
+
+/// A table-valued parameter's TYPE_INFO and rows (after its name and status).
+fn putTableValue(
+    out: borrow mut Vector<u8>,
+    params: borrow MsSqlParams,
+    p: MsParam,
+    session: SessionText,
+    scratch: borrow mut Vector<u8>,
+) -> Result<void, MsSqlError> {
+    let table = params.tableOf(p);
+    let quoted = params.valueOf(p)[8..]; // `[schema].[name]` or `[name]`
+    allocated(out.push(0xF3))?;
+    // TVP_TYPENAME: no database, then the schema (or none) and the name, without their brackets.
+    allocated(out.push(0))?;
+    let text = StringView.fromUtf8(quoted) ?? "";
+    match (text.indexOf("].[")) {
+        Some(dot) => {
+            putBVarchar(out, quoted[1..dot])?;
+            putBVarchar(out, quoted[dot + 3..quoted.length - 1])?;
+        }
+        null => {
+            allocated(out.push(0))?;
+            putBVarchar(out, quoted[1..quoted.length - 1])?;
+        }
+    }
+    // TVP_COLMETADATA: each column nullable and nameless, as the type names them.
+    let columns = table.columnList();
+    allocated(out.pushLE(truncate<u16>(columns.length)))?;
+    for (c in columns) {
+        allocated(out.pushLE(0u32))?;      // user type
+        allocated(out.pushLE(0x0001u16))?; // nullable
+        allocated(putColumnTypeInfo(out, c, session))?;
+        allocated(out.push(0))?; // no name
+    }
+    allocated(out.push(0x00))?;                   // TVP_END_TOKEN: no ordering
+    putRows(out, table, 0x01, session, scratch)?; // TVP_ROW_TOKEN
+    return allocated(out.push(0x00));             // TVP_END_TOKEN
+}
+
+/// `column type` for each of `table`'s columns, in parentheses, as INSERT BULK declares them.
+fn appendBulkColumns(table: borrow MsSqlTable, out: borrow mut Vector<u8>) -> Result<void, AllocError> {
+    out.extend(" (".bytes())?;
+    var first = true;
+    for (c in table.columnList()) {
+        if (!first) {
+            out.extend(", ".bytes())?;
+        }
+        first = false;
+        out.push('[')?;
+        out.extend(table.columnName(c).bytes())?;
+        out.extend("] ".bytes())?;
+        let k = c.kind;
+        if (k == P_BIGINT) {
+            out.extend("bigint".bytes())?;
+        } else if (k == P_INT) {
+            out.extend("int".bytes())?;
+        } else if (k == P_SMALLINT) {
+            out.extend("smallint".bytes())?;
+        } else if (k == P_TINYINT) {
+            out.extend("tinyint".bytes())?;
+        } else if (k == P_BIT) {
+            out.extend("bit".bytes())?;
+        } else if (k == P_FLOAT) {
+            out.extend("float".bytes())?;
+        } else if (k == P_REAL) {
+            out.extend("real".bytes())?;
+        } else if (k == P_MONEY) {
+            out.extend("money".bytes())?;
+        } else if (k == P_GUID) {
+            out.extend("uniqueidentifier".bytes())?;
+        } else if (k == P_DECIMAL) {
+            out.extend("decimal(".bytes())?;
+            pad(out, c.precision as i64, 1)?;
+            out.push(',')?;
+            pad(out, c.scale as i64, 1)?;
+            out.push(')')?;
+        } else if (k == P_NVARCHAR || k == P_VARCHAR || k == P_VARBINARY) {
+            out.extend(
+                if (k == P_NVARCHAR) "nvarchar(".bytes()
+                    else (if (k == P_VARCHAR) "varchar(".bytes() else "varbinary(".bytes()),
+            )?;
+            if (c.length == 0) {
+                out.extend("max".bytes())?;
+            } else {
+                pad(out, c.length as i64, 1)?;
+            }
+            out.push(')')?;
+        } else if (k == P_DATE) {
+            out.extend("date".bytes())?;
+        } else if (k == P_TIME) {
+            out.extend("time(7)".bytes())?;
+        } else if (k == P_DATETIME2) {
+            out.extend("datetime2(7)".bytes())?;
+        } else if (k == P_DATETIMEOFFSET) {
+            out.extend("datetimeoffset(7)".bytes())?;
+        } else if (k == P_DATETIME) {
+            out.extend("datetime".bytes())?;
+        }
+    }
+    return out.push(')');
+}
+
+/// A bulk load's message: COLMETADATA naming the columns, a ROW per row, then DONE.
+/// `nullable` says, column by column, whether the target column takes NULL: SQL Server wants a NOT NULL column's
+/// value in its fixed-length type (INT4, not INTN), as the target's own metadata has it.
+fn putBulkLoad(
+    out: borrow mut Vector<u8>,
+    table: borrow MsSqlTable,
+    nullable: Slice<bool>,
+    session: SessionText,
+) -> Result<void, MsSqlError> {
+    out.clear();
+    let columns = table.columnList();
+    allocated(out.push(0x81))?;
+    allocated(out.pushLE(truncate<u16>(columns.length)))?;
+    for (i in 0..columns.length) {
+        let c = columns[i];
+        allocated(out.pushLE(0u32))?;                                      // user type
+        allocated(out.pushLE(if (nullable[i]) 0x0005u16 else 0x0004u16))?; // read/write, and nullable or not
+        let fixed = if (nullable[i]) 0u8 else fixedType(c.kind);
+        if (fixed != 0) {
+            allocated(out.push(fixed))?;
+        } else {
+            allocated(putColumnTypeInfo(out, c, session))?;
+        }
+        putBVarchar(out, table.columnName(c).bytes())?;
+    }
+    var scratch = Vector<u8>.create();
+    var value = Vector<u8>.create();
+    let cells = table.cellList();
+    var i: usize = 0;
+    for (cell in cells.entryList()) {
+        if (i == 0) {
+            allocated(out.push(0xD1))?; // ROW
+        }
+        let fixed = if (nullable[i]) 0u8 else fixedType(columns[i].kind);
+        if (fixed != 0) {
+            if (cell.isNull) {
+                return Err(MsSqlError.Config); // NULL for a NOT NULL column
+            }
+            // The value without its length: everything after the BYTELEN putColumnValue writes.
+            value.clear();
+            putColumnValue(mut value, columns[i], cells.valueOf(cell), false, session, mut scratch)?;
+            allocated(out.extend(value[1..]))?;
+        } else {
+            putColumnValue(out, columns[i], cells.valueOf(cell), cell.isNull, session, mut scratch)?;
+        }
+        i += 1;
+        if (i == columns.length) {
+            i = 0;
+        }
+    }
+    allocated(out.push(0xFD))?; // DONE: final, no count
+    allocated(out.pushLE(0u16))?;
+    allocated(out.pushLE(0u16))?;
+    return allocated(out.pushLE(0u64));
 }

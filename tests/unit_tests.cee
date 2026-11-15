@@ -253,7 +253,56 @@ fn badStringsFail() -> Result<void, TestFailure> {
     Check.isTrue(MsSqlConfig.parse("Server=a,99999").isErr(), "port out of range")?;
     Check.isTrue(MsSqlConfig.parse("Server=a;Password='open").isErr(), "unclosed quote")?;
     Check.isTrue(MsSqlConfig.parse("Server=a;Encrypt=maybe").isErr(), "bad bool")?;
-    Check.isTrue(MsSqlConfig.parse("Server=np:\\\\.\\pipe\\sql").isErr(), "named pipes")?;
+    return Ok();
+}
+
+/// Which error `text` gives: "ok", "config", "unsupported", "authentication" or "other".
+fn parseOutcome(text: StringView) -> StringView {
+    return match (MsSqlConfig.parse(text)) {
+        Ok(_) => "ok",
+        Err(MsSqlError.Config) => "config",
+        Err(MsSqlError.Unsupported) => "unsupported",
+        Err(MsSqlError.UnsupportedAuthentication) => "authentication",
+        Err(_) => "other",
+    };
+}
+
+@test
+fn adoNetKeysAreKnownOrRefused() -> Result<void, TestFailure> {
+    // ADO.NET keys that change nothing here, in either spelling.
+    Check.equalText("ok", parseOutcome("Server=a;Pooling=false;Enlist=true;Persist Security Info=False;MultipleActiveResultSets=false"))?;
+    Check.equalText("ok", parseOutcome("Server=a;Multiple Active Result Sets=no;MultiSubnetFailover=False;Authentication=SqlPassword"))?;
+    Check.equalText("ok", parseOutcome("Server=a;Column Encryption Setting=Disabled;Pool Blocking Period=Auto;Network Library=dbmssocn"))?;
+    Check.equalText("ok", parseOutcome("Server=a;ServerSPN=MSSQLSvc/a:1433;Type System Version=Latest;Failover Partner="))?;
+    // Keys ADO.NET does not have.
+    Check.equalText("config", parseOutcome("Server=a;Colour=blue"))?;
+    Check.equalText("config", parseOutcome("Server=a;Pooling=sometimes"))?;
+    Check.equalText("config", parseOutcome("Server=a;Authentication=Magic"))?;
+    // What this client cannot do.
+    Check.equalText("unsupported", parseOutcome("Server=a;MultipleActiveResultSets=True"))?;
+    Check.equalText("unsupported", parseOutcome("Server=a;Column Encryption Setting=Enabled"))?;
+    Check.equalText("unsupported", parseOutcome("Server=a;Failover Partner=b"))?;
+    Check.equalText("unsupported", parseOutcome("Server=a;AttachDBFilename=|DataDirectory|\\x.mdf"))?;
+    Check.equalText("unsupported", parseOutcome("Server=a;ServerCertificate=/etc/ssl/sql.cer"))?;
+    Check.equalText("unsupported", parseOutcome("Server=a;User Instance=true"))?;
+    Check.equalText("unsupported", parseOutcome("Server=np:\\\\.\\pipe\\sql"))?;
+    Check.equalText("unsupported", parseOutcome("Server=a;Network Library=dbnmpntw"))?;
+    Check.equalText("authentication", parseOutcome("Server=a;Authentication=ActiveDirectoryDefault"))?;
+    Check.equalText("authentication", parseOutcome("Server=a;Authentication=Active Directory Managed Identity"))?;
+    return Ok();
+}
+
+@test
+fn poolAndAddressKeysParse() -> Result<void, TestFailure> {
+    let c = MsSqlConfig.parse("Server=a;Min Pool Size=4;Max Pool Size=20;Connection Lifetime=90;IPAddressPreference=IPv6First")!;
+    Check.equalU64(4, c.minPoolSize() as u64)?;
+    Check.equalU64(20, c.maxPoolSize() as u64)?;
+    Check.isTrue(c.connectionLifetime() == Some(90000u64), "lifetime in milliseconds")?;
+    Check.isTrue(c.addressPreference() is MsAddressPreference.IPv6First, "IPv6 first")?;
+    let plain = MsSqlConfig.parse("Server=a")!;
+    Check.isTrue(plain.connectionLifetime() == null, "no lifetime given")?;
+    Check.isTrue(plain.addressPreference() is MsAddressPreference.PlatformDefault, "resolver order")?;
+    Check.equalText("config", parseOutcome("Server=a;IPAddressPreference=IPv5First"))?;
     return Ok();
 }
 
@@ -527,5 +576,54 @@ fn executeSqlIsEncoded() -> Result<void, TestFailure> {
     params.clear();
     params.varchar("世界")!;
     Check.isTrue(putExecuteSql(mut out, "SELECT @p1", params, 0, session).isErr(), "unencodable varchar")?;
+    return Ok();
+}
+
+// ── Tables ───────────────────────────────────────────────────────────────────────────────────────────────────
+
+fn quoted(name: StringView, parts: usize) -> String {
+    var out = Vector<u8>.create();
+    var text = String.create();
+    if (quoteName(name, parts, mut out)!) {
+        let _ = text.append(StringView.fromUtf8(out.view()) ?? "");
+    } else {
+        let _ = text.append("refused");
+    }
+    return text;
+}
+
+@test
+fn tableNamesAreQuoted() -> Result<void, TestFailure> {
+    Check.equalText("[dbo].[Orders]", quoted("dbo.Orders", 3).view())?;
+    Check.equalText("[sales].[Order Lines]", quoted("[sales].[Order Lines]", 3).view())?;
+    Check.equalText("[#work]", quoted("#work", 3).view())?;
+    Check.equalText("[db].[dbo].[t]", quoted("db.dbo.t", 3).view())?;
+    Check.equalText("refused", quoted("db.dbo.t", 2).view())?;
+    Check.equalText("refused", quoted("dbo.Orders; DROP TABLE x", 3).view())?;
+    Check.equalText("refused", quoted("[a]]b]", 3).view())?;
+    Check.equalText("refused", quoted("dbo..t", 3).view())?;
+    Check.equalText("refused", quoted("", 3).view())?;
+    return Ok();
+}
+
+@test
+fn tableValuesFitTheirColumns() -> Result<void, TestFailure> {
+    var t = MsSqlTable.create();
+    t.column("small", MsSqlType.SmallInt)!;
+    t.decimalColumn("amount", 5, 2)!;
+    t.textColumn("name", 3)!;
+    Check.isTrue(t.int64(70000).isErr(), "out of smallint's range")?;
+    t.int64(7)!;
+    Check.isTrue(t.decimalText("1.234").isErr(), "a digit lost to the scale")?;
+    Check.isTrue(t.decimalText("12345").isErr(), "too many digits")?;
+    t.decimalText("123.4")!;
+    Check.isTrue(t.text("four").isErr(), "longer than nvarchar(3)")?;
+    Check.isTrue(t.bool(true).isErr(), "a bool for a text column")?;
+    t.text("abc")!;
+    Check.equalU64(1, t.rowCount() as u64)?;
+    Check.isTrue(t.column("late", MsSqlType.Int).isErr(), "columns before rows")?;
+    t.nullValue()!;
+    var p = MsSqlParams.create();
+    Check.isTrue(p.table("dbo.T", t).isErr(), "a partial row")?;
     return Ok();
 }

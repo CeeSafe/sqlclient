@@ -226,7 +226,7 @@ public struct MsSqlConnection {
             Err(e) => { return Err(MsSqlError.Io(e)); }
         };
         var failure = MsSqlError.Closed;
-        for (address in addresses.view()) {
+        for (address in preferred(addresses.view(), config.addressPreference())?.view()) {
             match (await AsyncTcpStream.connectTo(address)) {
                 Ok(tcp) => {
                     match (tcp.setNoDelay(true)) {
@@ -1287,6 +1287,94 @@ public struct MsSqlConnection {
         return await this.collectResults(PKT_RPC);
     }
 
+    /// Loads `rows` into table `table` (`dbo.Orders`, `[sales].[Order Lines]`, `#work`) as SqlBulkCopy does: an
+    /// `INSERT BULK` naming `rows`' columns, then the rows in TDS's bulk format, far faster than one INSERT per row.
+    /// Columns the table has and `rows` does not get their defaults. Gives how many rows the server took; a
+    /// constraint or type error fails the whole call (`Server`), and inside a transaction it can be rolled back.
+    ///
+    /// ```ceesafe
+    /// var rows = MsSqlTable.create();
+    /// rows.column("id", MsSqlType.Int)?;
+    /// rows.textColumn("name", 100)?;
+    /// for (k in 0..10000) {
+    ///     rows.int32(k)?;
+    ///     rows.text("a row")?;
+    /// }
+    /// let loaded = await db.bulkInsert("dbo.Orders", rows, MsBulkOptions.defaults())?;
+    /// ```
+    ///
+    /// The rows travel as one message, so a load of millions is best sent in parts: `clearRows()` and refill.
+    public async fn bulkInsert(
+        borrow mut this,
+        table: StringView,
+        rows: borrow MsSqlTable,
+        options: MsBulkOptions,
+    ) -> Result<u64, MsSqlError> {
+        this.ready()?;
+        if (!rows.complete()) {
+            return Err(MsSqlError.Config);
+        }
+        var sql = Vector<u8>.create();
+        allocated(sql.extend("INSERT BULK ".bytes()))?;
+        if (!allocated2(quoteName(table, 3, mut sql))?) {
+            return Err(MsSqlError.Config);
+        }
+        allocated(appendBulkColumns(rows, mut sql))?;
+        var with = Vector<u8>.create();
+        if (options.tableLock) {
+            allocated(with.extend("TABLOCK, ".bytes()))?;
+        }
+        if (options.checkConstraints) {
+            allocated(with.extend("CHECK_CONSTRAINTS, ".bytes()))?;
+        }
+        if (options.fireTriggers) {
+            allocated(with.extend("FIRE_TRIGGERS, ".bytes()))?;
+        }
+        if (options.keepNulls) {
+            allocated(with.extend("KEEP_NULLS, ".bytes()))?;
+        }
+        if (options.keepIdentity) {
+            allocated(with.extend("KEEPIDENTITY, ".bytes()))?;
+        }
+        if (with.length > 0) {
+            allocated(sql.extend(" WITH (".bytes()))?;
+            allocated(sql.extend(with[0..with.length - 2]))?;
+            allocated(sql.push(')'))?;
+        }
+        if (rows.rowCount() == 0) {
+            return Ok(0);
+        }
+        // The target's columns, as the server describes them: which take NULL. This also checks the names first.
+        var probe = Vector<u8>.create();
+        allocated(probe.extend("SELECT TOP (0) ".bytes()))?;
+        var first = true;
+        for (c in rows.columnList()) {
+            if (!first) {
+                allocated(probe.extend(", ".bytes()))?;
+            }
+            first = false;
+            allocated(probe.push('['))?;
+            allocated(probe.extend(rows.columnName(c).bytes()))?;
+            allocated(probe.push(']'))?;
+        }
+        allocated(probe.extend(" FROM ".bytes()))?;
+        let _ = allocated2(quoteName(table, 3, mut probe))?;
+        let noParams = MsSqlParams.create();
+        let target = await this.query(StringView.fromUtf8(probe.view()) ?? "", noParams)?;
+        var nullable = Vector<bool>.create();
+        for (k in 0..target.columnCount()) {
+            allocated(nullable.push(target.columnNullable(k)))?;
+        }
+        if (nullable.length != rows.columnCount()) {
+            return Err(MsSqlError.Protocol);
+        }
+        await this.batch(StringView.fromUtf8(sql.view()) ?? "")?;
+        putBulkLoad(mut this.output, rows, nullable.view(), this.session)?;
+        var none = MsSqlRows.create();
+        var rest = Vector<MsSqlRows>.create();
+        return await this.run(OP_COLLECT, PKT_BULK_LOAD, 0, mut none, mut rest, KEEP_NONE);
+    }
+
     /// Runs `sql` (a `SELECT … FOR JSON`) and appends its JSON text to `out`. The server splits long JSON over
     /// several rows of its first column; they are joined here.
     public async fn queryJson(
@@ -1594,4 +1682,31 @@ fn ioResult<T>(outcome: Result<T, AsyncError>) -> Result<T, MsSqlError> {
         Ok(v) => { return Ok(v); }
         Err(e) => { return Err(MsSqlError.Io(e)); }
     }
+}
+
+/// `addresses` in the order `preference` asks for: one family first, each in the resolver's order.
+fn preferred(
+    addresses: Slice<SocketAddress>,
+    preference: MsAddressPreference,
+) -> Result<Vector<SocketAddress>, MsSqlError> {
+    var ordered = Vector<SocketAddress>.create();
+    let v4First = match (preference) {
+        MsAddressPreference.PlatformDefault => {
+            for (a in addresses) {
+                allocated(ordered.push(a))?;
+            }
+            return Ok(ordered);
+        }
+        MsAddressPreference.IPv4First => true,
+        MsAddressPreference.IPv6First => false,
+    };
+    for (pass in 0..2) {
+        let wantV4 = if (pass == 0) v4First else !v4First;
+        for (a in addresses) {
+            if ((a is SocketAddress.V4(_, _)) == wantV4) {
+                allocated(ordered.push(a))?;
+            }
+        }
+    }
+    return Ok(ordered);
 }

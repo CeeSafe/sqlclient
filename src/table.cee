@@ -1,0 +1,385 @@
+// Rows to send: a table-valued parameter (`MsSqlParams.table`) or a bulk copy (`MsSqlConnection.bulkInsert`). Both
+// travel in TDS's own row format, typed column by column, with nothing spliced into SQL.
+
+/// A column of a `MsSqlTable`.
+struct MsTableColumn {
+    nameAt: usize;
+    nameLength: usize;
+    /// A parameter kind (`P_INT`, `P_NVARCHAR`, …).
+    kind: u8;
+    /// Characters for `nvarchar`/`varchar`, bytes for `varbinary`; 0 for `(max)`.
+    length: u32;
+    precision: u8;
+    scale: u8;
+}
+
+/// Typed columns and rows of values, for a table-valued parameter or a bulk copy.
+///
+/// ```ceesafe
+/// var lines = MsSqlTable.create();
+/// lines.column("id", MsSqlType.Int)?;
+/// lines.textColumn("name", 100)?;                   // nvarchar(100)
+/// lines.decimalColumn("amount", 18, 2)?;            // decimal(18, 2)
+/// lines.int32(1)?;
+/// lines.text("first")?;
+/// lines.decimalText("12.50")?;
+/// lines.int32(2)?;
+/// lines.text("second")?;
+/// lines.nullValue()?;                               // a row is its columns' values, in order
+/// ```
+///
+/// Each value is converted to its column's type as it is added: an `int64` fits an `int` column if it is in range, a
+/// decimal is rescaled to its column's scale if no digit is lost, and `dateTime` fills any date or time column.
+/// A value that does not fit fails with `Config`, and nothing is added.
+@noncopy
+public struct MsSqlTable {
+    private columns: Vector<MsTableColumn>;
+    private names: Vector<u8>;
+    private cellStore: MsSqlParams;
+
+    /// No columns and no rows.
+    public fn create() -> MsSqlTable => MsSqlTable {
+        columns: Vector<MsTableColumn>.create(),
+        names: Vector<u8>.create(),
+        cellStore: MsSqlParams.cells(),
+    };
+
+    /// A column of a type without a size: the integer types, `Bit`, `Float`, `Real`, `Money`, `UniqueIdentifier`,
+    /// `Date`, `Time`, `DateTime2`, `DateTimeOffset` and `DateTime`; also `NVarChar` (`nvarchar(4000)`), `VarChar`
+    /// (`varchar(8000)`), `VarBinary` (`varbinary(8000)`) and `Decimal` (`decimal(18, 0)`). Columns come before rows.
+    public fn column(borrow mut this, name: StringView, sqlType: MsSqlType) -> Result<void, MsSqlError> {
+        let kind: u8 = match (sqlType) {
+            MsSqlType.BigInt => P_BIGINT,
+            MsSqlType.Int => P_INT,
+            MsSqlType.SmallInt => P_SMALLINT,
+            MsSqlType.TinyInt => P_TINYINT,
+            MsSqlType.Bit => P_BIT,
+            MsSqlType.Float => P_FLOAT,
+            MsSqlType.Real => P_REAL,
+            MsSqlType.Money => P_MONEY,
+            MsSqlType.UniqueIdentifier => P_GUID,
+            MsSqlType.Date => P_DATE,
+            MsSqlType.Time => P_TIME,
+            MsSqlType.DateTime2 => P_DATETIME2,
+            MsSqlType.DateTimeOffset => P_DATETIMEOFFSET,
+            MsSqlType.DateTime => P_DATETIME,
+            MsSqlType.NVarChar => { return this.addColumn(name, P_NVARCHAR, 4000, 0, 0); }
+            MsSqlType.VarChar => { return this.addColumn(name, P_VARCHAR, 8000, 0, 0); }
+            MsSqlType.VarBinary => { return this.addColumn(name, P_VARBINARY, 8000, 0, 0); }
+            MsSqlType.Decimal => { return this.addColumn(name, P_DECIMAL, 0, 18, 0); }
+            MsSqlType.Numeric => { return this.addColumn(name, P_DECIMAL, 0, 18, 0); }
+            _ => { return Err(MsSqlError.Config); }
+        };
+        let scale: u8 =
+            if (kind == P_MONEY) 4u8
+                else (if (kind == P_TIME || kind == P_DATETIME2 || kind == P_DATETIMEOFFSET) 7u8 else 0u8);
+        return this.addColumn(name, kind, 0, 0, scale);
+    }
+
+    /// An `nvarchar(maxChars)` column (1 to 4000), or `nvarchar(max)` for 0.
+    public fn textColumn(borrow mut this, name: StringView, maxChars: u32) -> Result<void, MsSqlError> {
+        if (maxChars > 4000) {
+            return Err(MsSqlError.Config);
+        }
+        return this.addColumn(name, P_NVARCHAR, maxChars, 0, 0);
+    }
+
+    /// A `varchar(maxBytes)` column (1 to 8000), or `varchar(max)` for 0, in the server's code page.
+    public fn varcharColumn(borrow mut this, name: StringView, maxBytes: u32) -> Result<void, MsSqlError> {
+        if (maxBytes > 8000) {
+            return Err(MsSqlError.Config);
+        }
+        return this.addColumn(name, P_VARCHAR, maxBytes, 0, 0);
+    }
+
+    /// A `varbinary(maxBytes)` column (1 to 8000), or `varbinary(max)` for 0.
+    public fn binaryColumn(borrow mut this, name: StringView, maxBytes: u32) -> Result<void, MsSqlError> {
+        if (maxBytes > 8000) {
+            return Err(MsSqlError.Config);
+        }
+        return this.addColumn(name, P_VARBINARY, maxBytes, 0, 0);
+    }
+
+    /// A `decimal(precision, scale)` column: precision 1 to 38, scale at most the precision.
+    public fn decimalColumn(borrow mut this, name: StringView, precision: u8, scale: u8) -> Result<void, MsSqlError> {
+        if (precision == 0 || precision > 38 || scale > precision) {
+            return Err(MsSqlError.Config);
+        }
+        return this.addColumn(name, P_DECIMAL, 0, precision, scale);
+    }
+
+    fn addColumn(
+        borrow mut this,
+        name: StringView,
+        kind: u8,
+        length: u32,
+        precision: u8,
+        scale: u8,
+    ) -> Result<void, MsSqlError> {
+        if (this.cellStore.count() > 0 || name.length == 0 || name.length > 128 || name.contains("]") ||
+            Utf16.encodedLength(name) > 255) {
+            return Err(MsSqlError.Config);
+        }
+        let at = this.names.length;
+        allocated(this.names.extend(name.bytes()))?;
+        return allocated(this.columns.push(MsTableColumn {
+            nameAt: at,
+            nameLength: name.length,
+            kind: kind,
+            length: length,
+            precision: precision,
+            scale: scale,
+        }));
+    }
+
+    /// How many columns.
+    public fn columnCount(borrow this) -> usize => this.columns.length;
+
+    /// How many whole rows.
+    public fn rowCount(borrow this) -> usize =>
+        if (this.columns.length == 0) 0usize else this.cellStore.count() / this.columns.length;
+
+    /// Removes the rows, keeping the columns and the memory: for sending a large load in parts.
+    public fn clearRows(borrow mut this) {
+        this.cellStore.clear();
+    }
+
+    /// Whether every row has a value for each column.
+    fn complete(borrow this) -> bool => this.columns.length > 0 && this.cellStore.count() % this.columns.length == 0;
+
+    /// The column the next value goes in.
+    fn next(borrow this) -> Result<MsTableColumn, MsSqlError> {
+        if (this.columns.length == 0) {
+            return Err(MsSqlError.Config);
+        }
+        return Ok(this.columns[this.cellStore.count() % this.columns.length]);
+    }
+
+    // ---- Values ----
+
+    /// An integer, for an integer, `bit`-free, `decimal` or `money` column, if it fits.
+    public fn int64(borrow mut this, value: i64) -> Result<void, MsSqlError> {
+        let c = this.next()?;
+        let k = c.kind;
+        if (k == P_BIGINT) {
+            return this.cellStore.int64(value);
+        }
+        if (k == P_INT) {
+            return this.cellStore.int32(checkedTruncate<i32>(value) ?? { return Err(MsSqlError.Config); });
+        }
+        if (k == P_SMALLINT) {
+            return this.cellStore.int16(checkedTruncate<i16>(value) ?? { return Err(MsSqlError.Config); });
+        }
+        if (k == P_TINYINT) {
+            return this.cellStore.uint8(checkedTruncate<u8>(value) ?? { return Err(MsSqlError.Config); });
+        }
+        if (k == P_DECIMAL) {
+            return this.decimal(MsDecimal.ofInt(value, 0));
+        }
+        if (k == P_MONEY) {
+            let units = value.checkedMul(10000) ?? { return Err(MsSqlError.Config); };
+            return this.cellStore.money(units);
+        }
+        return Err(MsSqlError.Config);
+    }
+
+    /// An `int`-sized integer (see `int64`).
+    public fn int32(borrow mut this, value: i32) -> Result<void, MsSqlError> => this.int64(value as i64);
+
+    /// A `bit`.
+    public fn bool(borrow mut this, value: bool) -> Result<void, MsSqlError> {
+        if (this.next()?.kind != P_BIT) {
+            return Err(MsSqlError.Config);
+        }
+        return this.cellStore.bool(value);
+    }
+
+    /// A `float` or `real` (rounded to the nearest `real`).
+    public fn float64(borrow mut this, value: f64) -> Result<void, MsSqlError> {
+        let k = this.next()?.kind;
+        if (k == P_FLOAT) {
+            return this.cellStore.float64(value);
+        }
+        if (k == P_REAL) {
+            return this.cellStore.float32(round<f32>(value));
+        }
+        return Err(MsSqlError.Config);
+    }
+
+    /// A decimal for a `decimal` column, rescaled to its scale (`Config` if a digit would be lost or it has too
+    /// many digits), or for a `money` column (four places at most).
+    public fn decimal(borrow mut this, value: MsDecimal) -> Result<void, MsSqlError> {
+        let c = this.next()?;
+        if (c.kind == P_MONEY) {
+            var scaled = value.rescaled(4) ?? { return Err(MsSqlError.Config); };
+            scaled.scale = 0; // the same digits, read as ten-thousandths
+            let units = scaled.toInt64() ?? { return Err(MsSqlError.Config); };
+            return this.cellStore.money(units);
+        }
+        if (c.kind != P_DECIMAL) {
+            return Err(MsSqlError.Config);
+        }
+        let scaled = value.rescaled(c.scale) ?? { return Err(MsSqlError.Config); };
+        if (scaled.digitCount() > c.precision) {
+            return Err(MsSqlError.Config);
+        }
+        return this.cellStore.decimal(scaled);
+    }
+
+    /// A decimal from text such as `-1234.50` (see `decimal`).
+    public fn decimalText(borrow mut this, value: StringView) -> Result<void, MsSqlError> =>
+        this.decimal(MsDecimal.parse(value) ?? { return Err(MsSqlError.Config); });
+
+    /// Text for an `nvarchar` or `varchar` column. Text longer than the column fails when it is sent (`TooLarge`).
+    public fn text(borrow mut this, value: StringView) -> Result<void, MsSqlError> {
+        let c = this.next()?;
+        if (c.kind == P_NVARCHAR) {
+            if (c.length > 0 && Utf16.encodedLength(value) > c.length as usize * 2) {
+                return Err(MsSqlError.TooLarge);
+            }
+            return this.cellStore.text(value);
+        }
+        if (c.kind == P_VARCHAR) {
+            return this.cellStore.varchar(value);
+        }
+        return Err(MsSqlError.Config);
+    }
+
+    /// Bytes for a `varbinary` column.
+    public fn bytes(borrow mut this, value: Slice<u8>) -> Result<void, MsSqlError> {
+        let c = this.next()?;
+        if (c.kind != P_VARBINARY) {
+            return Err(MsSqlError.Config);
+        }
+        if (c.length > 0 && value.length > c.length as usize) {
+            return Err(MsSqlError.TooLarge);
+        }
+        return this.cellStore.bytes(value);
+    }
+
+    /// A `uniqueidentifier`.
+    public fn guid(borrow mut this, value: MsGuid) -> Result<void, MsSqlError> {
+        if (this.next()?.kind != P_GUID) {
+            return Err(MsSqlError.Config);
+        }
+        return this.cellStore.guid(value);
+    }
+
+    /// A date, time or both, for a `date`, `time`, `datetime2`, `datetimeoffset` or `datetime` column: each takes
+    /// the parts it holds.
+    public fn dateTime(borrow mut this, value: MsDateTime) -> Result<void, MsSqlError> {
+        let k = this.next()?.kind;
+        if (k == P_DATE) {
+            return this.cellStore.date(value);
+        }
+        if (k == P_TIME) {
+            return this.cellStore.time(value);
+        }
+        if (k == P_DATETIME2) {
+            return this.cellStore.dateTime(value);
+        }
+        if (k == P_DATETIMEOFFSET) {
+            return this.cellStore.dateTimeOffset(value);
+        }
+        if (k == P_DATETIME) {
+            return this.cellStore.legacyDateTime(value);
+        }
+        return Err(MsSqlError.Config);
+    }
+
+    /// SQL NULL, in any column.
+    public fn nullValue(borrow mut this) -> Result<void, MsSqlError> {
+        let c = this.next()?;
+        return this.cellStore.nullOfKind(c.kind, c.scale);
+    }
+
+    fn columnList(borrow this) -> Slice<MsTableColumn> => this.columns.view();
+
+    fn columnName(borrow this, c: MsTableColumn) -> StringView =>
+        StringView.fromUtf8(this.names[c.nameAt..c.nameAt + c.nameLength]) ?? "";
+
+    fn cellList(borrow this) -> borrow MsSqlParams => borrow this.cellStore;
+}
+
+/// How `MsSqlConnection.bulkInsert` loads rows, as `INSERT BULK`'s options (SqlBulkCopyOptions).
+public struct MsBulkOptions {
+    /// `TABLOCK`: a bulk update lock on the table, which allows minimal logging.
+    public tableLock: bool;
+    /// `CHECK_CONSTRAINTS`: check and foreign key constraints are checked (they are not by default).
+    public checkConstraints: bool;
+    /// `FIRE_TRIGGERS`: the table's insert triggers run.
+    public fireTriggers: bool;
+    /// `KEEP_NULLS`: NULLs stay NULL instead of taking the columns' defaults.
+    public keepNulls: bool;
+    /// `KEEPIDENTITY`: identity values are taken from the rows instead of generated.
+    public keepIdentity: bool;
+
+    /// No options: what SqlBulkCopy does by default.
+    public fn defaults() -> MsBulkOptions => MsBulkOptions {
+        tableLock: false,
+        checkConstraints: false,
+        fireTriggers: false,
+        keepNulls: false,
+        keepIdentity: false,
+    };
+}
+
+/// `name`, of at most `parts` dot-separated parts (`dbo.Orders`, `[sales].[Order Lines]`, `#work`), appended to
+/// `out` with every part bracketed: `[dbo].[Orders]`. False when it is not such a name: an empty part, a part longer
+/// than 128 bytes, a bracket inside a part, or a character other than letters, digits, `_`, `#`, `@` and `$`
+/// outside brackets.
+fn quoteName(name: StringView, parts: usize, out: borrow mut Vector<u8>) -> Result<bool, AllocError> {
+    let b = name.trim().bytes();
+    var at: usize = 0;
+    var count: usize = 0;
+    while (true) {
+        if (count == parts) {
+            return Ok(false);
+        }
+        var lo = at;
+        var hi = at;
+        if (at < b.length && b[at] == '[') {
+            lo = at + 1;
+            hi = lo;
+            while (hi < b.length && b[hi] != ']') {
+                if (b[hi] == '[') {
+                    return Ok(false);
+                }
+                hi += 1;
+            }
+            if (hi >= b.length) {
+                return Ok(false);
+            }
+            at = hi + 1;
+        } else {
+            while (hi < b.length && b[hi] != '.') {
+                let c = b[hi];
+                let ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' ||
+                    c == '#' || c == '@' || c == '$' || c >= 0x80;
+                if (!ok) {
+                    return Ok(false);
+                }
+                hi += 1;
+            }
+            at = hi;
+        }
+        if (hi == lo || hi - lo > 128) {
+            return Ok(false);
+        }
+        if (count > 0) {
+            out.push('.')?;
+        }
+        out.push('[')?;
+        out.extend(b[lo..hi])?;
+        out.push(']')?;
+        count += 1;
+        if (at == b.length) {
+            return Ok(true);
+        }
+        if (b[at] != '.') {
+            return Ok(false);
+        }
+        at += 1;
+    }
+    return Ok(false);
+}

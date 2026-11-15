@@ -13,6 +13,16 @@ public enum MsEncrypt {
     Strict,
 }
 
+/// Which addresses of a host name are tried first, as `IPAddressPreference`.
+public enum MsAddressPreference {
+    /// In the order the resolver gives them (`UsePlatformDefault`).
+    PlatformDefault,
+    /// IPv4 addresses, then IPv6 (`IPv4First`, ADO.NET's default).
+    IPv4First,
+    /// IPv6 addresses, then IPv4 (`IPv6First`).
+    IPv6First,
+}
+
 const DEFAULT_PORT: u16 = 1433;
 const DEFAULT_PACKET_SIZE: u32 = 8000;
 const DEFAULT_CONNECT_TIMEOUT_MS: u64 = 15000;
@@ -43,6 +53,10 @@ public struct MsSqlConfig {
     private packetBytes: u32;
     private readOnly: bool;
     private poolSize: usize;
+    private minPool: usize;
+    /// `Connection Lifetime`, when given; else the pool's default.
+    private lifetimeMillis: u64?;
+    private addressOrder: MsAddressPreference;
     private tlsConfig: TlsConfig?;
 
     fn empty() -> MsSqlConfig => MsSqlConfig {
@@ -65,6 +79,9 @@ public struct MsSqlConfig {
         packetBytes: DEFAULT_PACKET_SIZE,
         readOnly: false,
         poolSize: DEFAULT_MAX_POOL,
+        minPool: 0,
+        lifetimeMillis: null,
+        addressOrder: MsAddressPreference.PlatformDefault,
         tlsConfig: null,
     };
 
@@ -99,7 +116,11 @@ public struct MsSqlConfig {
     /// `false`, `yes`, `no`, `mandatory`, `optional`, `strict`), `TrustServerCertificate`, `HostNameInCertificate`,
     /// `Application Name` (`App`), `Workstation ID` (`WSID`), `Current Language` (`Language`), `Connect Timeout`
     /// (`Connection Timeout`, `Timeout`) and `Command Timeout` in seconds, `Packet Size`, `ApplicationIntent`
-    /// (`ReadOnly`, `ReadWrite`) and `Max Pool Size`. Others are ignored.
+    /// (`ReadOnly`, `ReadWrite`), `Max Pool Size`, `Min Pool Size`, `Connection Lifetime` and `IPAddressPreference`.
+    /// Spaces in keys do not matter. ADO.NET's other keys are accepted where they change nothing here (`Pooling`,
+    /// `Enlist`, `Persist Security Info`, …) and `Unsupported` where they ask for what this client lacks
+    /// (`MultipleActiveResultSets=true`, `Column Encryption Setting=Enabled`, `Failover Partner`, …);
+    /// `Authentication=ActiveDirectory…` is `UnsupportedAuthentication`; an unknown key is `Config`.
     public fn parse(text: StringView) -> Result<MsSqlConfig, MsSqlError> {
         var config = MsSqlConfig.empty();
         let trimmed = text.trim();
@@ -384,7 +405,91 @@ public struct MsSqlConfig {
             this.poolSize = n;
             return Ok();
         }
-        return Ok();
+        return this.setOther(key, value);
+    }
+
+    /// The keys beyond the common ones: those with an effect here, those ADO.NET has that change nothing for this
+    /// client (accepted, their values checked), and those that ask for what it cannot do (`Unsupported`). A key ADO.NET
+    /// does not know is `Config`, as its "Keyword not supported".
+    fn setOther(borrow mut this, key: StringView, value: StringView) -> Result<void, MsSqlError> {
+        if (isKey(key, "min pool size")) {
+            this.minPool = value.parseInt<usize>() ?? { return Err(MsSqlError.Config); };
+            return Ok();
+        }
+        if (isKey(key, "connection lifetime") || isKey(key, "load balance timeout")) {
+            this.lifetimeMillis = Some(parseSeconds(value)?);
+            return Ok();
+        }
+        if (isKey(key, "ip address preference")) {
+            if (value.equalsIgnoreAsciiCase("ipv4first")) {
+                this.addressOrder = MsAddressPreference.IPv4First;
+            } else if (value.equalsIgnoreAsciiCase("ipv6first")) {
+                this.addressOrder = MsAddressPreference.IPv6First;
+            } else if (value.equalsIgnoreAsciiCase("useplatformdefault")) {
+                this.addressOrder = MsAddressPreference.PlatformDefault;
+            } else {
+                return Err(MsSqlError.Config);
+            }
+            return Ok();
+        }
+        if (isKey(key, "authentication")) {
+            if (value.equalsIgnoreAsciiCase("sqlpassword") || value.equalsIgnoreAsciiCase("sql password")) {
+                return Ok();
+            }
+            if (startsWithIgnoreCase(value, "activedirectory") || startsWithIgnoreCase(value, "active directory")) {
+                return Err(MsSqlError.UnsupportedAuthentication);
+            }
+            return Err(MsSqlError.Config);
+        }
+        // Booleans whose `true` asks for something this client does not do.
+        if (isKey(key, "multiple active result sets") || isKey(key, "mars") || isKey(key, "multi subnet failover") ||
+            isKey(key, "user instance") || isKey(key, "context connection") || isKey(key, "replication")) {
+            if (parseBool(value)?) {
+                return Err(MsSqlError.Unsupported);
+            }
+            return Ok();
+        }
+        // Values that must be empty, or the feature's off value.
+        if (isKey(key, "failover partner") || isKey(key, "attach db filename") || isKey(key, "extended properties") ||
+            isKey(
+                key,
+                "initial file name",
+            ) || isKey(key, "server certificate") || isKey(key, "enclave attestation url")) {
+            return if (value.length == 0) Ok() else Err(MsSqlError.Unsupported);
+        }
+        if (isKey(key, "column encryption setting")) {
+            if (value.equalsIgnoreAsciiCase("disabled")) {
+                return Ok();
+            }
+            return if (value.equalsIgnoreAsciiCase("enabled")) Err(MsSqlError.Unsupported) else Err(MsSqlError.Config);
+        }
+        if (isKey(key, "attestation protocol")) {
+            return if (value.length == 0 || value.equalsIgnoreAsciiCase("none")) Ok() else Err(MsSqlError.Unsupported);
+        }
+        if (isKey(key, "network library") || isKey(key, "network") || isKey(key, "net")) {
+            return if (value.equalsIgnoreAsciiCase("dbmssocn")) Ok() else Err(MsSqlError.Unsupported);
+        }
+        // Booleans that change nothing here: `Pooling` (MsSqlConnection never pools, MsSqlPool always does),
+        // `Enlist` (there is no ambient transaction to enlist in), and the rest.
+        if (isKey(key, "pooling") || isKey(key, "enlist") || isKey(key, "persist security info") ||
+            isKey(key, "persistsecurityinfo") || isKey(key, "asynchronous processing") || isKey(key, "async") ||
+            isKey(key, "transparent network ip resolution")) {
+            let _ = parseBool(value)?;
+            return Ok();
+        }
+        if (isKey(key, "pool blocking period")) {
+            if (value.equalsIgnoreAsciiCase("auto") || value.equalsIgnoreAsciiCase("alwaysblock") ||
+                value.equalsIgnoreAsciiCase("neverblock")) {
+                return Ok();
+            }
+            return Err(MsSqlError.Config);
+        }
+        // Text that changes nothing here: no Kerberos, so no SPN; the newest type system is the only one.
+        if (isKey(key, "server spn") || isKey(key, "failover partner spn") || isKey(key, "type system version") ||
+            isKey(key, "transaction binding")) {
+            return Ok();
+        }
+        return Err(MsSqlError.Config);
     }
 
     /// `host`, `host,port`, `tcp:host,port`, `host\instance`, `[v6],port`, `.` or `(local)`.
@@ -392,7 +497,7 @@ public struct MsSqlConfig {
         var server = text.trim();
         if (startsWithIgnoreCase(server, "np:") || startsWithIgnoreCase(server, "lpc:") ||
             startsWithIgnoreCase(server, "admin:")) {
-            return Err(MsSqlError.Config); // named pipes, shared memory and the DAC are not supported
+            return Err(MsSqlError.Unsupported); // named pipes, shared memory and the DAC
         }
         if (startsWithIgnoreCase(server, "tcp:")) {
             server = server[4..].trim();
@@ -500,6 +605,13 @@ public struct MsSqlConfig {
     public fn readOnlyIntent(borrow this) -> bool => this.readOnly;
     /// `Max Pool Size`: the size `MsSqlPool.fromConfig` gives a pool.
     public fn maxPoolSize(borrow this) -> usize => this.poolSize;
+    /// `Min Pool Size`: how many connections `MsSqlPool.warmUp` opens (0 by default).
+    public fn minPoolSize(borrow this) -> usize => this.minPool;
+    /// `Connection Lifetime` (`Load Balance Timeout`) in milliseconds, when given: the age at which a pool closes a
+    /// connection as its lease ends (0: never).
+    public fn connectionLifetime(borrow this) -> u64? => this.lifetimeMillis;
+    /// `IPAddressPreference`: which of a host's addresses are tried first.
+    public fn addressPreference(borrow this) -> MsAddressPreference => this.addressOrder;
     /// The name the server's certificate must carry: `HostNameInCertificate`, else the host.
     fn certificateHost(borrow this) -> StringView =>
         if (this.certificateName.length > 0) this.certificateName.view() else this.hostName.view();
@@ -511,7 +623,31 @@ fn replaceText(target: borrow mut String, value: StringView) -> Result<void, MsS
     return allocated(target.append(value));
 }
 
-fn isKey(key: StringView, name: StringView) -> bool => key.equalsIgnoreAsciiCase(name);
+/// Whether `key` is `name`, ignoring ASCII case and spaces, as ADO.NET does (`Connect Timeout`, `ConnectTimeout`).
+fn isKey(key: StringView, name: StringView) -> bool {
+    let a = key.bytes();
+    let b = name.bytes();
+    var i: usize = 0;
+    var j: usize = 0;
+    loop {
+        while (i < a.length && a[i] == ' ') {
+            i += 1;
+        }
+        while (j < b.length && b[j] == ' ') {
+            j += 1;
+        }
+        if (i == a.length || j == b.length) {
+            return i == a.length && j == b.length;
+        }
+        if (lowerAscii(a[i]) != lowerAscii(b[j])) {
+            return false;
+        }
+        i += 1;
+        j += 1;
+    }
+}
+
+fn lowerAscii(c: u8) -> u8 => if (c >= 'A' && c <= 'Z') c + 32 else c;
 
 fn startsWithIgnoreCase(text: StringView, prefix: StringView) -> bool =>
     text.length >= prefix.length && text.bytes()[0..prefix.length].equalsIgnoreAsciiCase(prefix.bytes());

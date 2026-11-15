@@ -64,9 +64,36 @@ public struct MsSqlPool {
     }
 
     /// A pool of the configuration's `Max Pool Size` (100 by default).
+    /// Its connections live for the configuration's `Connection Lifetime` when it gives one (0: no limit), else an
+    /// hour. `warmUp` opens `Min Pool Size` of them ahead of need.
     public fn fromConfig(config: MsSqlConfig) -> Result<MsSqlPool, MsSqlError> {
         let size = config.maxPoolSize();
-        return MsSqlPool.create(config, size);
+        let lifetime = config.connectionLifetime();
+        var pool = MsSqlPool.create(config, size)?;
+        match (lifetime) {
+            Some(ms) => { pool.lifetimeMillis = truncate<i64>(ms); }
+            null => {}
+        }
+        return Ok(pool);
+    }
+
+    /// Opens connections until the pool holds the configuration's `Min Pool Size` (at most its size), so that
+    /// the first leases do not wait for a login. Gives how many it opened; the first failure stops it.
+    public async fn warmUp(borrow this) -> Result<usize, MsSqlError> {
+        let want = if (this.settings.minPoolSize() > this.max) this.max else this.settings.minPoolSize();
+        var opened: usize = 0;
+        while (this.max - this.unissued.load() < want) {
+            var slot = this.issue() ?? { break; };
+            // A lease owns the slot from here, so a failed connect gives it back through the drop.
+            var lease = MsSqlLease { slot: slot, home: this.slots.clone(), lifetimeMillis: this.lifetimeMillis };
+            let connection = await MsSqlConnection.connect(borrow this.settings)?;
+            allocated(lease.slot.connection.push(connection))?;
+            let now = Clock.unixMillis();
+            lease.slot.opened = now;
+            lease.slot.used = now;
+            opened += 1;
+        }
+        return Ok(opened);
     }
 
     /// Replaces connections idle longer than `millis` when they are next taken (0: never).

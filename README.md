@@ -189,6 +189,45 @@ var built = String.create();                       // FOR JSON, its pieces joine
 await db.queryJson("SELECT customer, total FROM #orders FOR JSON PATH", none, mut built)?;
 ```
 
+### Table-valued parameters
+
+```ceesafe
+// CREATE TYPE dbo.IdList AS TABLE (id int PRIMARY KEY)
+var ids = MsSqlTable.create();
+ids.column("id", MsSqlType.Int)?;
+for (id in 1..6) {
+    ids.int32(id * id)?;
+}
+var p = MsSqlParams.create();
+p.table("dbo.IdList", ids)?;                       // declared READONLY; columns in the type's order
+let rows = await db.query("SELECT o.* FROM orders o JOIN @p1 i ON i.id = o.id", p)?;
+```
+
+`callProcedure` takes them too, for a procedure's `@ids dbo.IdList READONLY`.
+
+### Bulk copy
+
+```ceesafe
+var rows = MsSqlTable.create();
+rows.column("id", MsSqlType.Int)?;
+rows.textColumn("kind", 20)?;                      // nvarchar(20); textColumn(name, 0) is nvarchar(max)
+rows.column("at", MsSqlType.DateTime2)?;
+rows.decimalColumn("amount", 12, 2)?;
+for (k in 0..10000) {
+    rows.int32(k)?;
+    rows.text("click")?;
+    rows.dateTime(MsDateTime.of(2026, 11, 15, 12, 0, 0, 0))?;
+    rows.decimal(MsDecimal.ofInt(k as i64, 1))?;   // rescaled to the column's two places
+}
+var options = MsBulkOptions.defaults();
+options.tableLock = true;                          // also checkConstraints, fireTriggers, keepNulls, keepIdentity
+let loaded = await db.bulkInsert("dbo.events", rows, options)?;
+```
+
+Columns are matched by name, and the table's other columns get their defaults. Each value is checked against its
+column as it is added (range, scale, length), so a bad value fails at `rows.int32(…)` and not halfway through a load.
+For millions of rows, load in parts: `rows.clearRows()` and refill.
+
 ### Timeouts
 
 ```ceesafe
@@ -243,7 +282,13 @@ result set as tab-separated text, then the server's messages.
 
 - **Connecting.** `MsSqlConfig.parse` reads ADO.NET connection strings (`Server`, `Database`, `User Id`, `Password`,
   `Encrypt`, `TrustServerCertificate`, `Connect Timeout`, `Command Timeout`, `Packet Size`, `ApplicationIntent`,
-  `Max Pool Size`, …, quoted values included) and `sqlserver://user:pass@host:port/instance?database=…` URLs.
+  `Max Pool Size`, `Min Pool Size`, `Connection Lifetime`, `IPAddressPreference`, …, quoted values included) and
+  `sqlserver://user:pass@host:port/instance?database=…` URLs.
+  - Keys match as in ADO.NET, ignoring case and spaces. ADO.NET keys that change nothing here (`Pooling`, `Enlist`,
+    `Persist Security Info`, …) are accepted. Those that ask for a feature this client lacks
+    (`MultipleActiveResultSets=true`, `Column Encryption Setting=Enabled`, `Failover Partner`, `ServerCertificate`,
+    named pipes) fail with `MsSqlError.Unsupported`, and `Authentication=ActiveDirectory…` with
+    `UnsupportedAuthentication`. A key ADO.NET does not have fails with `Config`, as its "Keyword not supported".
   - The server is `host`, `host,port`, `tcp:host,port`, `[v6],port`, or `host\instance`; a named instance's port is
     asked of SQL Server Browser (UDP 1434).
   - Every address a name resolves to is tried in order, and Azure SQL's gateway redirect is followed.
@@ -297,10 +342,16 @@ result set as tab-separated text, then the server's messages.
   which follows the server's transaction descriptor, so `BEGIN TRAN` in SQL counts too.
 - **Pool.** `MsSqlPool.fromConfig(config)` shares up to `Max Pool Size` connections between tasks, on any worker.
   - `var lease = await pool.acquire()?;` then `lease.connection()`.
+  - `await pool.warmUp()?` opens `Min Pool Size` connections ahead of need. `Connection Lifetime` sets how long a
+    connection is reused (an hour by default; 0 for no limit).
   - A connection that failed, is mid-stream, has a transaction open, or is past its lifetime (an hour) is dropped
     instead of reused. One idle over five minutes is replaced.
   - A reused connection's session is reset with its next request (TDS's RESETCONNECTION flag:
     temporary tables, `SET` options and the isolation level as new).
+- **Table-valued parameters and bulk copy.** `MsSqlTable` holds typed columns and rows. `params.table(type, rows)`
+  sends them as a table-valued parameter, and `bulkInsert(table, rows, options)` loads them as SqlBulkCopy does
+  (`INSERT BULK`, then the rows in TDS's bulk format), with `TABLOCK`, `CHECK_CONSTRAINTS`, `FIRE_TRIGGERS`,
+  `KEEP_NULLS` and `KEEPIDENTITY`.
 - **Backups.** `backupDatabase` and `restoreDatabase`, with the name and the path passed as parameters.
 
 ## Changes from CosmoSQLClient
@@ -330,9 +381,8 @@ Bugs and bottlenecks in the C# driver that this port does not carry over:
 
 - The ADO.NET (`DbConnection`) and Entity Framework Core surfaces, and `QueryAsync<T>`'s reflection mapping.
   CeeSafe has no reflection; read cells with the typed getters.
-- Kerberos and Entra ID (Azure AD) logins, Always Encrypted, MARS, bulk copy (BCP), table-valued parameters, the
-  UTF-8 feature extension, and the double-byte code pages (932, 936, 949, 950) for `varchar` (they read as U+FFFD
-  past ASCII).
+- Kerberos and Entra ID (Azure AD) logins, Always Encrypted, MARS, the UTF-8 feature extension, and the
+  double-byte code pages (932, 936, 949, 950) for `varchar` (they read as U+FFFD past ASCII).
 - MySQL and Oracle: CosmoSQLClient's other drivers are for separate packages.
 
 ## Tests
@@ -354,7 +404,8 @@ The live tests (checked against SQL Server 2025) cover:
 - every type each way, injection-shaped text, and 10 MB values;
 - multiple result sets, `PRINT`, procedures with output parameters and a return status, and `sp_executesql` outputs;
 - errors mid-result, transactions, and 200,000 streamed rows with an early cancel;
-- a command timeout answered by an attention, the pool's session reset, and `FOR JSON`.
+- a command timeout answered by an attention, the pool's session reset and warm-up, and `FOR JSON`;
+- table-valued parameters and bulk copies of fourteen column types, NULLs, defaults, 20,000 rows, and a refused load.
 
 ## Benchmarks
 
