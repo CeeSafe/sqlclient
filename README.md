@@ -352,6 +352,12 @@ result set as tab-separated text, then the server's messages.
     answer is used and the others are cancelled. Azure SQL's gateway redirect is followed.
   - A transient login error (an Azure SQL database starting, paused or moving: 4060, 40613, 40197, …) is tried
     again `ConnectRetryCount` times (1 by default), `ConnectRetryInterval` apart (10 s).
+  - **Session recovery** (idle connection resiliency). With `ConnectRetryCount` above 0, the login asks for TDS's
+    session recovery, and the connection follows the session's state as the server reports it. If the server or the
+    network drops the connection while it is idle (a restart, a failover, a `KILL`), the next call logs in again
+    with that state, so the database, the language, the `SET` options and the rest are as they were, and then runs:
+    the caller sees nothing but `db.recoveries()` going up. A connection in a transaction, or holding state the
+    server cannot recover, is not recovered, and its call fails.
   - Each attempt is bounded by the connect timeout (15 s).
 - **Encryption.**
   - `Encrypt=true` (the default) encrypts the whole session, with the TLS handshake carried in PRELOGIN packets.
@@ -458,8 +464,6 @@ Bugs and bottlenecks in the C# driver that this port does not carry over:
 - Kerberos and Entra ID (Azure AD) logins, Always Encrypted, MARS, `sql_variant`, CLR type and fixed `char`
   parameters (send `nvarchar` or `varbinary`, which the server converts), the UTF-8 feature extension, and the
   double-byte code pages (932, 936, 949, 950) for `varchar` (they read as U+FFFD past ASCII).
-- Session recovery: a connection outside a pool that the server closes while idle fails its next call (`Closed` or
-  `Io`) instead of reconnecting with its session restored. A pool replaces such connections.
 - MySQL and Oracle: CosmoSQLClient's other drivers are for separate packages.
 
 ## Tests
@@ -482,7 +486,8 @@ The live tests (checked against SQL Server 2025) cover:
 - multiple result sets, `PRINT`, procedures with output parameters and a return status, and `sp_executesql` outputs;
 - errors mid-result, transactions, and 200,000 streamed rows with an early cancel;
 - a command timeout answered by an attention, the pool's session reset and warm-up, a pooled connection replaced
-  after a `KILL`, transient login errors retried, and `FOR JSON`;
+  after a `KILL`, transient login errors retried, a killed session recovered with its `SET` options and language
+  (and not in a transaction, nor with `ConnectRetryCount=0`), and `FOR JSON`;
 - table-valued parameters and bulk copies of fourteen column types, NULLs, defaults, 20,000 rows, and a refused load;
 - a batch of 102 commands (inserts, two result sets, a procedure's output), and one with a failing command inside;
 - a 6 MB `nvarchar(max)` of emoji streamed as UTF-8 with every character whole, a NULL, a skipped value;

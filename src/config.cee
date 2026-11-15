@@ -98,6 +98,44 @@ public struct MsSqlConfig {
         tlsConfig: null,
     };
 
+    /// A copy, sharing the TLS configuration (and its trusted roots). A connection keeps one to log in again when
+    /// it recovers its session.
+    public fn clone(borrow this) -> Result<MsSqlConfig, MsSqlError> {
+        var c = MsSqlConfig.empty();
+        replaceText(mut c.hostName, this.hostName.view())?;
+        c.portNumber = this.portNumber;
+        replaceText(mut c.instanceName, this.instanceName.view())?;
+        replaceText(mut c.databaseName, this.databaseName.view())?;
+        replaceText(mut c.userName, this.userName.view())?;
+        replaceText(mut c.secret, this.secret.view())?;
+        replaceText(mut c.domainName, this.domainName.view())?;
+        c.integrated = this.integrated;
+        c.encryptMode = this.encryptMode;
+        c.trustCertificate = this.trustCertificate;
+        replaceText(mut c.certificateName, this.certificateName.view())?;
+        replaceText(mut c.application, this.application.view())?;
+        replaceText(mut c.workstationName, this.workstationName.view())?;
+        replaceText(mut c.languageName, this.languageName.view())?;
+        c.connectMillis = this.connectMillis;
+        c.commandMillis = this.commandMillis;
+        c.packetBytes = this.packetBytes;
+        c.readOnly = this.readOnly;
+        c.poolSize = this.poolSize;
+        c.minPool = this.minPool;
+        c.lifetimeMillis = this.lifetimeMillis;
+        c.addressOrder = this.addressOrder;
+        c.parallelConnect = this.parallelConnect;
+        c.retryCount = this.retryCount;
+        c.retryMillis = this.retryMillis;
+        replaceText(mut c.pinPath, this.pinPath.view())?;
+        allocated(c.pinDer.extend(this.pinDer.view()))?;
+        c.tlsConfig = match (borrow this.tlsConfig) {
+            Some(t) => Some(t.clone()),
+            null => null,
+        };
+        return Ok(c);
+    }
+
     /// A SQL login `user` on `host`:1433, database `database`, encrypted and with the certificate checked.
     public fn create(
         host: StringView,
@@ -704,7 +742,8 @@ public struct MsSqlConfig {
     /// availability group listener in several subnets needs.
     public fn multiSubnetFailover(borrow this) -> bool => this.parallelConnect;
     /// `ConnectRetryCount` (1 by default, 0 to 255): how many times `connect` tries again after a transient login
-    /// error, such as an Azure SQL database still starting.
+    /// error, such as an Azure SQL database still starting, and how many logins an idle connection that the server
+    /// dropped tries to recover its session with. 0 turns both off.
     public fn connectRetryCount(borrow this) -> u8 => this.retryCount;
     /// `ConnectRetryInterval` in milliseconds (10 s by default, 1 to 60 s): the wait before each retry.
     public fn connectRetryInterval(borrow this) -> u64 => this.retryMillis;

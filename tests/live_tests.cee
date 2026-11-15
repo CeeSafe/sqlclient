@@ -1482,6 +1482,118 @@ fn serverCertificatesPin() -> Result<void, TestFailure> {
     return report(Async.run(pinning(text)));
 }
 
+/// Ends session `spid` from another connection, as a restart or a failover would.
+async fn killSession(config: borrow MsSqlConfig, spid: i64) -> Result<void, MsSqlError> {
+    var admin = await MsSqlConnection.connect(config)?;
+    var kill = String.create();
+    let _ = kill.append("KILL ");
+    let _ = kill.appendNumber(spid);
+    await admin.batch(kill.view())?;
+    let _ = await Timer.sleep(500);
+    return Ok();
+}
+
+async fn recovered(config: borrow MsSqlConfig, text: StringView) -> Outcome {
+    let none = MsSqlParams.create();
+    let who = "SELECT @@SPID, CONVERT(nvarchar(40), login_time, 121) FROM sys.dm_exec_sessions WHERE session_id = @@SPID";
+    var db = match (await MsSqlConnection.connect(config)) {
+        Ok(c) => c,
+        Err(e) => { return connectFailed(e); }
+    };
+    match (await db.batch("SET LOCK_TIMEOUT 4321; SET LANGUAGE Deutsch; SET DATEFORMAT ydm")) {
+        Ok(_) => {}
+        Err(e) => { return failed(e, db); }
+    }
+    var spid: i64 = 0;
+    var loggedIn = String.create();
+    match (await db.query(who, none)) {
+        Ok(r) => {
+            spid = r.int64(0, 0) ?? 0;
+            let _ = loggedIn.append(r.text(0, 1) ?? "");
+        }
+        Err(e) => { return failed(e, db); }
+    }
+    match (await killSession(config, spid)) {
+        Ok() => {}
+        Err(e) => { return connectFailed(e); }
+    }
+    // The next query finds the connection gone, logs in again with the session's state, and runs.
+    match (await db.query("SELECT @@LOCK_TIMEOUT, @@LANGUAGE, DB_NAME(), (SELECT date_format FROM sys.dm_exec_sessions WHERE session_id = @@SPID)", none)) {
+        Ok(r) => {
+            if (r.int64(0, 0) != Some(4321i64) || r.text(0, 1) != Some("Deutsch") || r.text(0, 3) != Some("ydm")) {
+                return wrong("the session's SET options and language restored");
+            }
+            if (r.text(0, 2) != Some(db.database())) {
+                return wrong("the same database");
+            }
+        }
+        Err(e) => { return failed(e, db); }
+    }
+    if (db.recoveries() != 1) {
+        return wrong("one recovery");
+    }
+    match (await db.query(who, none)) {
+        Ok(r) => {
+            if (r.int64(0, 0) == Some(spid) && r.text(0, 1) == Some(loggedIn.view())) {
+                return wrong("a new session");
+            }
+        }
+        Err(e) => { return failed(e, db); }
+    }
+    // A transaction cannot be recovered: the call fails, as the server's work is lost.
+    match (await db.begin()) {
+        Ok() => {}
+        Err(e) => { return failed(e, db); }
+    }
+    match (await db.query("SELECT @@SPID", none)) {
+        Ok(r) => { spid = r.int64(0, 0) ?? 0; }
+        Err(e) => { return failed(e, db); }
+    }
+    match (await killSession(config, spid)) {
+        Ok() => {}
+        Err(e) => { return connectFailed(e); }
+    }
+    match (await db.query("SELECT 1", none)) {
+        Ok(_) => { return wrong("a transaction's session not recovered"); }
+        Err(_) => {}
+    }
+    // Without ConnectRetryCount, no recovery either.
+    var full = String.create();
+    let _ = full.append(text);
+    let _ = full.append(";ConnectRetryCount=0");
+    let noRetry = match (MsSqlConfig.parse(full.view())) {
+        Ok(c) => c,
+        Err(e) => { return connectFailed(e); }
+    };
+    var plain = match (await MsSqlConnection.connect(noRetry)) {
+        Ok(c) => c,
+        Err(e) => { return connectFailed(e); }
+    };
+    match (await plain.query("SELECT @@SPID", none)) {
+        Ok(r) => { spid = r.int64(0, 0) ?? 0; }
+        Err(e) => { return failed(e, plain); }
+    }
+    match (await killSession(config, spid)) {
+        Ok() => {}
+        Err(e) => { return connectFailed(e); }
+    }
+    match (await plain.query("SELECT 1", none)) {
+        Ok(_) => { return wrong("no recovery with ConnectRetryCount=0"); }
+        Err(_) => {}
+    }
+    return passed();
+}
+
+@test
+fn idleSessionsRecover() -> Result<void, TestFailure> {
+    let text = match (Environment.variable("MSSQL_TEST_CONNECTION")) {
+        Some(t) => t,
+        null => { return Ok(); }
+    };
+    let config = testConfig()!;
+    return report(Async.run(recovered(config, text)));
+}
+
 async fn json(config: borrow MsSqlConfig) -> Outcome {
     var db = match (await MsSqlConnection.connect(config)) {
         Ok(c) => c,

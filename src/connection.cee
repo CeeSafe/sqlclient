@@ -176,6 +176,13 @@ public struct MsSqlConnection {
     private status: i32?;
     /// Streaming one value of a row (`nextRow`): 0 none, 1 reading the value, 2 the value read and the rest of the
     /// row not yet.
+    /// The session's language (ENVCHANGE), for session recovery.
+    private languageName: String;
+    /// What session recovery needs, and whether this login is a reconnect.
+    private recovery: MsSessionRecovery;
+    private reconnecting: bool;
+    /// How many times the session was recovered.
+    private recoveredCount: u32;
     private seqPhase: u8;
     /// The streamed column.
     private seqColumn: usize;
@@ -209,17 +216,38 @@ public struct MsSqlConnection {
     /// (an Azure SQL database starting, paused or moving: 4060, 40613, …) is tried again up to `ConnectRetryCount`
     /// times, `ConnectRetryInterval` apart, each attempt with the whole connect timeout.
     public async fn connect(config: borrow MsSqlConfig) -> Result<MsSqlConnection, MsSqlError> {
+        // With ConnectRetryCount, the login asks for session recovery, and the connection keeps a copy of `config`
+        // to log in again with should the server drop it while it is idle.
+        var features = Vector<u8>.create();
+        if (config.connectRetryCount() > 0) {
+            MsSessionRecovery.request(mut features)?;
+        }
+        var c = await MsSqlConnection.connectWith(config, features.view(), false)?;
+        if (c.recovery.acknowledged) {
+            c.recovery.begin(c.databaseName.view(), c.languageName.view(), c.session.collation)?;
+            c.recovery.config = Some(config.clone()?);
+        }
+        return Ok(c);
+    }
+
+    /// `connect`, with `features` in the login (a reconnect's recovery data when `reconnecting`).
+    async fn connectWith(
+        config: borrow MsSqlConfig,
+        features: Slice<u8>,
+        reconnecting: bool,
+    ) -> Result<MsSqlConnection, MsSqlError> {
         var pin = Vector<u8>.create();
         await config.loadPin(mut pin)?;
         var attempt: u8 = 0;
         loop {
             var transient = false;
             let ms = config.connectTimeout();
-            let outcome = if (ms == 0) await MsSqlConnection.open(config, pin.view(), mut transient)
+            let plan = MsLoginPlan { pin: pin.view(), features: features, reconnecting: reconnecting };
+            let outcome = if (ms == 0) await MsSqlConnection.open(config, plan, mut transient)
                 else await Async.timeout(
                     ms,
                     MsSqlError.TimedOut,
-                    async () => await MsSqlConnection.open(config, pin.view(), mut transient),
+                    async () => await MsSqlConnection.open(config, plan, mut transient),
                 );
             match (outcome) {
                 Ok(c) => { return Ok(c); }
@@ -236,21 +264,21 @@ public struct MsSqlConnection {
 
     async fn open(
         config: borrow MsSqlConfig,
-        pin: Slice<u8>,
+        plan: MsLoginPlan,
         transient: borrow mut bool,
     ) -> Result<MsSqlConnection, MsSqlError> {
         var port = config.port();
         if (port == 0) {
             port = await browseInstancePort(config.host(), config.instance())?;
         }
-        var connection = await MsSqlConnection.openAt(config, config.host(), port, pin, transient)?;
+        var connection = await MsSqlConnection.openAt(config, config.host(), port, plan, transient)?;
         if (connection.routeHost.length == 0) {
             return Ok(connection);
         }
         // Routed: log in again where the server says.
         let host = replace(mut connection.routeHost, String.create());
         let routedPort = connection.routePort;
-        var routed = await MsSqlConnection.openAt(config, host.view(), routedPort, pin, transient)?;
+        var routed = await MsSqlConnection.openAt(config, host.view(), routedPort, plan, transient)?;
         routed.routeHost.clear();
         return Ok(routed);
     }
@@ -259,7 +287,7 @@ public struct MsSqlConnection {
         config: borrow MsSqlConfig,
         host: StringView,
         port: u16,
-        pin: Slice<u8>,
+        plan: MsLoginPlan,
         transient: borrow mut bool,
     ) -> Result<MsSqlConnection, MsSqlError> {
         let resolved = match (await AsyncDns.resolve(host, port)) {
@@ -274,7 +302,8 @@ public struct MsSqlConnection {
             Err(_) => {}
         }
         var connection = MsSqlConnection.over(tcp, config.commandTimeout())?;
-        match (await connection.login(config, host, pin)) {
+        connection.reconnecting = plan.reconnecting;
+        match (await connection.login(config, host, plan)) {
             Ok() => { return Ok(connection); }
             Err(e) => {
                 match (connection.lastError()) {
@@ -318,6 +347,10 @@ public struct MsSqlConnection {
             errorList: Vector<MsSqlMessage>.create(),
             infoList: Vector<MsSqlMessage>.create(),
             status: null,
+            languageName: String.create(),
+            recovery: noRecovery(),
+            reconnecting: false,
+            recoveredCount: 0,
             seqPhase: 0,
             seqColumn: 0,
             seqChunkLeft: 0,
@@ -344,8 +377,9 @@ public struct MsSqlConnection {
         borrow mut this,
         config: borrow MsSqlConfig,
         host: StringView,
-        pin: Slice<u8>,
+        plan: MsLoginPlan,
     ) -> Result<void, MsSqlError> {
+        let pin = plan.pin;
         let tlsConfig = config.tls() ?? { return Err(MsSqlError.Config); };
         let certificateHost = config.certificateHost();
         // 0: no TLS; 1: TLS for the login only; 2: TLS throughout.
@@ -410,6 +444,7 @@ public struct MsSqlConnection {
             sspi: negotiate.view(),
             packetSize: config.packetSize(),
             readOnlyIntent: config.readOnlyIntent(),
+            features: plan.features,
         };
         buildLogin7(fields, mut this.output)?;
         await this.sendMessage(PKT_LOGIN7)?;
@@ -800,7 +835,17 @@ public struct MsSqlConnection {
                     this.needBytes = avail + 1;
                     return Ok(NEED);
                 }
-                pos += 5 + (data.readLE<u32>(pos + 1) as usize);
+                let length = data.readLE<u32>(pos + 1) as usize;
+                if (pos + 5 + length > data.length) {
+                    this.needBytes = pos + 5 + length - at;
+                    return Ok(NEED);
+                }
+                if (data[pos] == FEATURE_SESSION_RECOVERY) {
+                    var ack = Vector<u8>.create();
+                    allocated(ack.extend(data[pos + 5..pos + 5 + length]))?;
+                    this.recovery.acknowledge(ack.view(), this.reconnecting)?;
+                }
+                pos += 5 + length;
             }
         }
         if (token == 0xE4) {
@@ -814,7 +859,10 @@ public struct MsSqlConnection {
                 this.needBytes = 5 + length;
                 return Ok(NEED);
             }
+            var body = Vector<u8>.create();
+            allocated(body.extend(data[at + 5..at + 5 + length]))?;
             this.payStart = at + 5 + length;
+            this.recovery.update(body.view())?;
             return Ok(0);
         }
         if (token == 0xAA || token == 0xAB || token == 0xE3 || token == 0xAD || token == 0xED || token == 0xA9 ||
@@ -893,6 +941,13 @@ public struct MsSqlConnection {
             // The database: new name (B_VARCHAR), old name.
             this.databaseName.clear();
             match (readBVarchar(body, 1, body.length, mut this.databaseName)?) {
+                Some(_) => {}
+                null => { return Err(MsSqlError.Protocol); }
+            }
+        } else if (kind == 2) {
+            // The language: new name (B_VARCHAR), old name.
+            this.languageName.clear();
+            match (readBVarchar(body, 1, body.length, mut this.languageName)?) {
                 Some(_) => {}
                 null => { return Err(MsSqlError.Protocol); }
             }
@@ -1178,6 +1233,7 @@ public struct MsSqlConnection {
         keep: u8,
     ) -> Result<u64, MsSqlError> {
         if (op == OP_COLLECT || op == OP_START) {
+            await this.recoverIfDropped()?;
             this.busy = true;
         }
         let ms = this.commandMillis;
@@ -1393,6 +1449,7 @@ public struct MsSqlConnection {
             return Ok(MsSqlBatchResults.of(Vector<MsSqlResults>.create()));
         }
         putBatch(mut this.output, batch, this.descriptor, this.session)?;
+        await this.recoverIfDropped()?;
         this.busy = true;
         let ms = this.commandMillis;
         let outcome = if (ms == 0) await this.performBatch()
@@ -2071,6 +2128,59 @@ public struct MsSqlConnection {
     /// login's "changed database context".
     public fn messages(borrow this) -> Slice<MsSqlMessage> => this.infoList.view();
 
+    /// How many times this connection recovered its session: logged in again, with its state restored, after the
+    /// server or the network dropped it while idle.
+    public fn recoveries(borrow this) -> u32 => this.recoveredCount;
+
+    /// Before a request (already written to `output`): if the server dropped this idle connection and its session
+    /// can be recovered, logs in again with the session's state (ConnectRetryCount attempts, ConnectRetryInterval
+    /// apart) and takes the new connection's place, the request kept. A connection in a transaction, or whose
+    /// session holds a state the server cannot recover, is not recovered: the request then fails as it would.
+    async fn recoverIfDropped(borrow mut this) -> Result<void, MsSqlError> {
+        if (this.descriptor != 0 || !this.recovery.possible() || await this.isAlive()) {
+            return Ok();
+        }
+        var request = Vector<u8>.create();
+        this.recovery.recoveryRequest(
+            this.databaseName.view(),
+            this.languageName.view(),
+            this.session.collation,
+            mut request,
+        )?;
+        let config = replace(mut this.recovery.config, null) ?? { return Ok(); };
+        let tries = config.connectRetryCount() as u32;
+        var failure = MsSqlError.Closed;
+        var attempt: u32 = 0;
+        while (attempt < tries) {
+            match (await MsSqlConnection.connectWith(borrow config, request.view(), true)) {
+                Ok(fresh) => {
+                    var c = fresh;
+                    // The new session goes on where the old one was: the request, its settings, its state.
+                    c.output = replace(mut this.output, Vector<u8>.create());
+                    c.resetPending = this.resetPending;
+                    c.commandMillis = this.commandMillis;
+                    var state = replace(mut this.recovery, noRecovery());
+                    for (st in c.recovery.states.view()) {
+                        state.setState(st.id, st.data.view(), st.recoverable)?;
+                    }
+                    state.acknowledged = c.recovery.acknowledged;
+                    state.config = Some(config);
+                    c.recovery = state;
+                    c.recoveredCount = this.recoveredCount + 1;
+                    *this = c;
+                    return Ok();
+                }
+                Err(e) => { failure = e; }
+            }
+            attempt += 1;
+            if (attempt < tries) {
+                ioResult(await Timer.sleep(config.connectRetryInterval()))?;
+            }
+        }
+        this.recovery.config = Some(config);
+        return Err(failure);
+    }
+
     /// The certificate the server presented, as DER, put in `out`: what `ServerCertificate` or
     /// `MsSqlConfig.setServerCertificate` would pin. False when the session is not encrypted (after a login-only
     /// encryption, `Encrypt=false`).
@@ -2344,4 +2454,12 @@ fn checkPin(engine: borrow TlsEngine, pin: Slice<u8>) -> Result<void, MsSqlError
         return Err(MsSqlError.Tls(TlsError.Certificate));
     }
     return Ok();
+}
+
+/// What a login sends beyond the configuration: a pinned certificate to check, feature extensions, and whether it
+/// recovers a session.
+struct MsLoginPlan<region r> {
+    pin: Slice<r, u8>;
+    features: Slice<r, u8>;
+    reconnecting: bool;
 }

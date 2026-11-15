@@ -333,6 +333,7 @@ fn login7IsLaidOut() -> Result<void, TestFailure> {
         sspi: [],
         packetSize: 8000,
         readOnlyIntent: false,
+        features: [],
     };
     var out = Vector<u8>.create();
     buildLogin7(fields, mut out)!;

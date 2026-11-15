@@ -1,0 +1,229 @@
+// Session recovery (MS-TDS 2.2.6.4 SESSIONRECOVERY, 2.2.7.21 SESSIONSTATE): what a connection needs to log in again
+// with its session as it was, when the server or the network dropped it while it sat idle.
+//
+// At login the client asks for the feature; the server acknowledges it with the session's initial state, and then
+// reports each change in SESSIONSTATE tokens. A reconnect sends both, the initial state and the current one, and the
+// server rebuilds the session from them: database, language, collation, SET options, user context and the rest.
+
+/// The SESSIONRECOVERY feature's id.
+const FEATURE_SESSION_RECOVERY: u8 = 0x01;
+/// What ends a FeatureExt block.
+const FEATURE_TERMINATOR: u8 = 0xFF;
+
+/// One session state the server reported (`StateId`), with its latest value.
+@noncopy
+struct MsSessionState {
+    id: u8;
+    data: Vector<u8>;
+    recoverable: bool;
+}
+
+/// A record of a SessionStateDataSet: its id, and where its value is.
+struct MsStateRecord {
+    id: u8;
+    at: usize;
+    length: usize;
+    /// Where the next record starts.
+    end: usize;
+}
+
+/// The record at `at` of a SessionStateDataSet, or null when `bytes` ends there (Protocol when it is cut short).
+fn stateRecordAt(bytes: Slice<u8>, at: usize) -> Result<MsStateRecord?, MsSqlError> {
+    if (at >= bytes.length) {
+        return Ok(null);
+    }
+    if (at + 2 > bytes.length) {
+        return Err(MsSqlError.Protocol);
+    }
+    let id = bytes[at];
+    var length = bytes[at + 1] as usize;
+    var valueAt = at + 2;
+    if (length == 0xFF) {
+        if (at + 6 > bytes.length) {
+            return Err(MsSqlError.Protocol);
+        }
+        length = bytes.readLE<u32>(at + 2) as usize;
+        valueAt = at + 6;
+    }
+    if (valueAt + length > bytes.length) {
+        return Err(MsSqlError.Protocol);
+    }
+    return Ok(Some(MsStateRecord { id: id, at: valueAt, length: length, end: valueAt + length }));
+}
+
+/// A record: the id, the length (one byte, or 0xFF and four), the value.
+fn putStateRecord(out: borrow mut Vector<u8>, id: u8, value: Slice<u8>) -> Result<void, MsSqlError> {
+    allocated(out.push(id))?;
+    if (value.length < 0xFF) {
+        allocated(out.push(truncate<u8>(value.length)))?;
+    } else {
+        allocated(out.push(0xFF))?;
+        allocated(out.pushLE(truncate<u32>(value.length)))?;
+    }
+    return allocated(out.extend(value));
+}
+
+/// A collation as recovery data has it: its length (0 when none or unchanged), then its five bytes.
+fn putRecoveryCollation(out: borrow mut Vector<u8>, collation: Slice<u8>) -> Result<void, MsSqlError> {
+    allocated(out.push(truncate<u8>(collation.length)))?;
+    return allocated(out.extend(collation));
+}
+
+/// What a connection keeps to recover its session.
+@noncopy
+struct MsSessionRecovery {
+    /// The server agreed to recover this session (its FEATUREEXTACK).
+    acknowledged: bool;
+    /// The session as it began: database, language and collation after the first login, and the states the
+    /// acknowledgement gave (records as sent).
+    initialDatabase: String;
+    initialLanguage: String;
+    initialCollation: [u8; 5];
+    initialStates: Vector<u8>;
+    /// The latest value of each state reported since.
+    states: Vector<MsSessionState>;
+    /// The configuration to log in again with, when ConnectRetryCount allows it.
+    config: MsSqlConfig?;
+}
+
+fn noRecovery() -> MsSessionRecovery => MsSessionRecovery {
+    acknowledged: false,
+    initialDatabase: String.create(),
+    initialLanguage: String.create(),
+    initialCollation: [0u8; 5],
+    initialStates: Vector<u8>.create(),
+    states: Vector<MsSessionState>.create(),
+    config: null,
+};
+
+impl MsSessionRecovery {
+    /// The FeatureExt block of a first login: session recovery asked for, nothing to recover.
+    fn request(out: borrow mut Vector<u8>) -> Result<void, MsSqlError> {
+        out.clear();
+        allocated(out.push(FEATURE_SESSION_RECOVERY))?;
+        allocated(out.pushLE(0u32))?;
+        return allocated(out.push(FEATURE_TERMINATOR));
+    }
+
+    /// The server's acknowledgement, with the session's states: the initial ones on a first login, the recovered
+    /// ones (which are the latest) on a reconnect.
+    fn acknowledge(borrow mut this, data: Slice<u8>, reconnecting: bool) -> Result<void, MsSqlError> {
+        this.acknowledged = true;
+        if (!reconnecting) {
+            this.initialStates.clear();
+            return allocated(this.initialStates.extend(data));
+        }
+        var at: usize = 0;
+        loop {
+            let record = stateRecordAt(data, at)? ?? { return Ok(); };
+            this.setState(record.id, data[record.at..record.end], true)?;
+            at = record.end;
+        }
+    }
+
+    /// A SESSIONSTATE token's body (after its length): a sequence number, a status (bit 0: recoverable), records.
+    fn update(borrow mut this, body: Slice<u8>) -> Result<void, MsSqlError> {
+        if (body.length < 5) {
+            return Err(MsSqlError.Protocol);
+        }
+        let recoverable = (body[4] & 0x01) != 0;
+        var at: usize = 5;
+        loop {
+            let record = stateRecordAt(body, at)? ?? { return Ok(); };
+            this.setState(record.id, body[record.at..record.end], recoverable)?;
+            at = record.end;
+        }
+    }
+
+    fn setState(borrow mut this, id: u8, value: Slice<u8>, recoverable: bool) -> Result<void, MsSqlError> {
+        for (k in 0..this.states.length) {
+            if (this.states[k].id == id) {
+                this.states[k].data.clear();
+                allocated(this.states[k].data.extend(value))?;
+                this.states[k].recoverable = recoverable;
+                return Ok();
+            }
+        }
+        var data = Vector<u8>.create();
+        allocated(data.extend(value))?;
+        return allocated(this.states.push(MsSessionState { id: id, data: data, recoverable: recoverable }));
+    }
+
+    /// Records the session as the first login left it.
+    fn begin(
+        borrow mut this,
+        database: StringView,
+        language: StringView,
+        collation: [u8; 5],
+    ) -> Result<void, MsSqlError> {
+        this.initialDatabase.clear();
+        allocated(this.initialDatabase.append(database))?;
+        this.initialLanguage.clear();
+        allocated(this.initialLanguage.append(language))?;
+        this.initialCollation = collation;
+        this.states.clear();
+        return Ok();
+    }
+
+    /// Whether the session can be rebuilt: acknowledged, with every reported state recoverable, and a way to log in.
+    fn possible(borrow this) -> bool {
+        if (!this.acknowledged || this.config.isNull()) {
+            return false;
+        }
+        for (s in this.states.view()) {
+            if (!s.recoverable) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /// The FeatureExt block of a reconnect: the initial session, then the session to be (what changed since).
+    fn recoveryRequest(
+        borrow this,
+        database: StringView,
+        language: StringView,
+        collation: [u8; 5],
+        out: borrow mut Vector<u8>,
+    ) -> Result<void, MsSqlError> {
+        var initial = Vector<u8>.create();
+        putBVarchar(mut initial, this.initialDatabase.view().bytes())?;
+        putRecoveryCollation(mut initial, this.initialCollation[..])?;
+        putBVarchar(mut initial, this.initialLanguage.view().bytes())?;
+        allocated(initial.extend(this.initialStates.view()))?;
+        var current = Vector<u8>.create();
+        putBVarchar(mut current, if (database == this.initialDatabase.view()) "".bytes() else database.bytes())?;
+        let unchanged: Slice<u8> = [];
+        putRecoveryCollation(
+            mut current,
+            if (collation[..] == this.initialCollation[..]) unchanged else collation[..],
+        )?;
+        putBVarchar(mut current, if (language == this.initialLanguage.view()) "".bytes() else language.bytes())?;
+        for (s in this.states.view()) {
+            if (!this.initiallyThe(s.id, s.data.view())?) {
+                putStateRecord(mut current, s.id, s.data.view())?;
+            }
+        }
+        out.clear();
+        allocated(out.push(FEATURE_SESSION_RECOVERY))?;
+        allocated(out.pushLE(truncate<u32>(4 + initial.length + 4 + current.length)))?;
+        allocated(out.pushLE(truncate<u32>(initial.length)))?;
+        allocated(out.extend(initial.view()))?;
+        allocated(out.pushLE(truncate<u32>(current.length)))?;
+        allocated(out.extend(current.view()))?;
+        return allocated(out.push(FEATURE_TERMINATOR));
+    }
+
+    /// Whether state `id` was `value` when the session began.
+    fn initiallyThe(borrow this, id: u8, value: Slice<u8>) -> Result<bool, MsSqlError> {
+        let all = this.initialStates.view();
+        var at: usize = 0;
+        loop {
+            let record = stateRecordAt(all, at)? ?? { return Ok(false); };
+            if (record.id == id) {
+                return Ok(all[record.at..record.end] == value);
+            }
+            at = record.end;
+        }
+    }
+}

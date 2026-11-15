@@ -94,6 +94,9 @@ struct LoginFields<region r> {
     sspi: Slice<r, u8>;
     packetSize: u32;
     readOnlyIntent: bool;
+    /// The feature extensions (MS-TDS 2.2.6.4 FeatureExt), each an id, a four-byte length and data, ended by 0xFF;
+    /// empty for none.
+    features: Slice<r, u8>;
 }
 
 /// A LOGIN7 message (MS-TDS 2.2.6.4).
@@ -113,9 +116,9 @@ fn buildLogin7(fields: borrow LoginFields, out: borrow mut Vector<u8>) -> Result
     w[24] = 0xE0;
     w[25] = if (fields.sspi.length > 0) 0x83u8 else 0x03u8;
     w[26] = if (fields.readOnlyIntent) 0x20u8 else 0x00u8;
-    w[27] = 0;
-    w.writeLE(28, 0i32);      // client time zone
-    w.writeLE(32, 0x0409u32); // client LCID
+    w[27] = if (fields.features.length > 0) 0x10u8 else 0u8; // OptionFlags3: fExtension
+    w.writeLE(28, 0i32);                                     // client time zone
+    w.writeLE(32, 0x0409u32);                                // client LCID
     // The variable part, in the offset table's order.
     var at = fixed;
     at = putLoginText(out, 36, fields.hostName, at, false)?;
@@ -123,7 +126,17 @@ fn buildLogin7(fields: borrow LoginFields, out: borrow mut Vector<u8>) -> Result
     at = putLoginText(out, 44, fields.password, at, true)?;
     at = putLoginText(out, 48, fields.appName, at, false)?;
     at = putLoginText(out, 52, fields.serverName, at, false)?;
-    at = putLoginText(out, 56, "", at, false)?; // no extension
+    // The extension: a four-byte offset of the FeatureExt block, which goes at the very end.
+    let extensionAt = out.length;
+    if (fields.features.length > 0) {
+        allocated(out.resize(out.length + 4, 0))?;
+        let e = out.viewMut();
+        e.writeLE(56, truncate<u16>(extensionAt));
+        e.writeLE(58, 4u16);
+        at = out.length;
+    } else {
+        at = putLoginText(out, 56, "", at, false)?;
+    }
     at = putLoginText(out, 60, "sqlclient", at, false)?;
     at = putLoginText(out, 64, fields.language, at, false)?;
     at = putLoginText(out, 68, fields.database, at, false)?;
@@ -133,6 +146,11 @@ fn buildLogin7(fields: borrow LoginFields, out: borrow mut Vector<u8>) -> Result
     }
     let sspiAt = out.length;
     allocated(out.extend(fields.sspi))?;
+    if (fields.features.length > 0) {
+        let featuresAt = out.length;
+        allocated(out.extend(fields.features))?;
+        out.viewMut().writeLE(extensionAt, truncate<u32>(featuresAt));
+    }
     let total = out.length;
     if (total > 0xFFFF) {
         return Err(MsSqlError.TooLarge);
