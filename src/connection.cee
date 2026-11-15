@@ -209,15 +209,17 @@ public struct MsSqlConnection {
     /// (an Azure SQL database starting, paused or moving: 4060, 40613, …) is tried again up to `ConnectRetryCount`
     /// times, `ConnectRetryInterval` apart, each attempt with the whole connect timeout.
     public async fn connect(config: borrow MsSqlConfig) -> Result<MsSqlConnection, MsSqlError> {
+        var pin = Vector<u8>.create();
+        await config.loadPin(mut pin)?;
         var attempt: u8 = 0;
         loop {
             var transient = false;
             let ms = config.connectTimeout();
-            let outcome = if (ms == 0) await MsSqlConnection.open(config, mut transient)
+            let outcome = if (ms == 0) await MsSqlConnection.open(config, pin.view(), mut transient)
                 else await Async.timeout(
                     ms,
                     MsSqlError.TimedOut,
-                    async () => await MsSqlConnection.open(config, mut transient),
+                    async () => await MsSqlConnection.open(config, pin.view(), mut transient),
                 );
             match (outcome) {
                 Ok(c) => { return Ok(c); }
@@ -232,19 +234,23 @@ public struct MsSqlConnection {
         }
     }
 
-    async fn open(config: borrow MsSqlConfig, transient: borrow mut bool) -> Result<MsSqlConnection, MsSqlError> {
+    async fn open(
+        config: borrow MsSqlConfig,
+        pin: Slice<u8>,
+        transient: borrow mut bool,
+    ) -> Result<MsSqlConnection, MsSqlError> {
         var port = config.port();
         if (port == 0) {
             port = await browseInstancePort(config.host(), config.instance())?;
         }
-        var connection = await MsSqlConnection.openAt(config, config.host(), port, transient)?;
+        var connection = await MsSqlConnection.openAt(config, config.host(), port, pin, transient)?;
         if (connection.routeHost.length == 0) {
             return Ok(connection);
         }
         // Routed: log in again where the server says.
         let host = replace(mut connection.routeHost, String.create());
         let routedPort = connection.routePort;
-        var routed = await MsSqlConnection.openAt(config, host.view(), routedPort, transient)?;
+        var routed = await MsSqlConnection.openAt(config, host.view(), routedPort, pin, transient)?;
         routed.routeHost.clear();
         return Ok(routed);
     }
@@ -253,6 +259,7 @@ public struct MsSqlConnection {
         config: borrow MsSqlConfig,
         host: StringView,
         port: u16,
+        pin: Slice<u8>,
         transient: borrow mut bool,
     ) -> Result<MsSqlConnection, MsSqlError> {
         let resolved = match (await AsyncDns.resolve(host, port)) {
@@ -267,7 +274,7 @@ public struct MsSqlConnection {
             Err(_) => {}
         }
         var connection = MsSqlConnection.over(tcp, config.commandTimeout())?;
-        match (await connection.login(config, host)) {
+        match (await connection.login(config, host, pin)) {
             Ok() => { return Ok(connection); }
             Err(e) => {
                 match (connection.lastError()) {
@@ -333,7 +340,12 @@ public struct MsSqlConnection {
     }
 
     /// PRELOGIN, TLS, LOGIN7 and its answer.
-    async fn login(borrow mut this, config: borrow MsSqlConfig, host: StringView) -> Result<void, MsSqlError> {
+    async fn login(
+        borrow mut this,
+        config: borrow MsSqlConfig,
+        host: StringView,
+        pin: Slice<u8>,
+    ) -> Result<void, MsSqlError> {
         let tlsConfig = config.tls() ?? { return Err(MsSqlError.Config); };
         let certificateHost = config.certificateHost();
         // 0: no TLS; 1: TLS for the login only; 2: TLS throughout.
@@ -342,6 +354,7 @@ public struct MsSqlConnection {
             MsEncrypt.Strict => {
                 var engine = tlsEngine(tlsConfig, certificateHost)?;
                 await this.handshakeRaw(mut engine)?;
+                checkPin(borrow engine, pin)?;
                 this.tls = engine;
                 buildPreLoginOrFail(ENCRYPT_ON, config.instance(), mut this.output)?;
                 await this.sendMessage(PKT_PRELOGIN)?;
@@ -366,6 +379,7 @@ public struct MsSqlConnection {
                 if (level > 0) {
                     var engine = tlsEngine(tlsConfig, certificateHost)?;
                     await this.handshakeWrapped(mut engine)?;
+                    checkPin(borrow engine, pin)?;
                     this.tls = engine;
                 }
             }
@@ -1321,6 +1335,43 @@ public struct MsSqlConnection {
         return await this.execute(sql, none);
     }
 
+    /// Describes the result `sql` would give with `params`, without running it (as GetSchemaTable with KeyInfo):
+    /// one row per column, from `sp_describe_first_result_set` in browse mode. Its columns include `name`,
+    /// `is_nullable`, `system_type_name` (`nvarchar(50)`), `max_length`, `precision`, `scale`, `collation_name`,
+    /// `source_database`, `source_schema`, `source_table` and `source_column` (where the column comes from),
+    /// `is_identity_column`, `is_computed_column`, `is_updateable`, `is_part_of_unique_key` and `is_hidden` (a key
+    /// column the query did not ask for, added so that each row can be told apart). Only the parameters' types
+    /// matter, not their values. Look the columns up by name: `rows.columnIndex("source_table")`.
+    ///
+    /// ```ceesafe
+    /// let shape = await db.describeResult("SELECT o.id, c.name FROM orders o JOIN customers c ON …", none)?;
+    /// for (r in 0..shape.rowCount()) {
+    ///     let column = shape.text(r, shape.columnIndex("name")!);
+    ///     let table = shape.text(r, shape.columnIndex("source_table")!);   // orders, customers
+    /// }
+    /// ```
+    public async fn describeResult(
+        borrow mut this,
+        sql: StringView,
+        params: borrow MsSqlParams,
+    ) -> Result<MsSqlRows, MsSqlError> {
+        var declarations = Vector<u8>.create();
+        allocated(appendDeclarations(params, mut declarations))?;
+        var p = MsSqlParams.create();
+        p.name("@tsql");
+        p.text(sql)?;
+        p.name("@params");
+        p.text(StringView.fromUtf8(declarations.view()) ?? "")?;
+        p.name("@browse_information_mode");
+        p.uint8(1)?;
+        let results = await this.callProcedure("sys.sp_describe_first_result_set", p)?;
+        if (results.count() == 0) {
+            return Err(MsSqlError.Protocol);
+        }
+        var all = results;
+        return Ok(replace(mut all.sets[0], MsSqlRows.create()));
+    }
+
     /// Calls stored procedure `name` with `params`, which are passed by name (`params.name("@id")` before each);
     /// output parameters (`params.output()`) come back in `outputs()`, the `RETURN` value in `returnStatus()`.
     public async fn callProcedure(
@@ -2020,6 +2071,17 @@ public struct MsSqlConnection {
     /// login's "changed database context".
     public fn messages(borrow this) -> Slice<MsSqlMessage> => this.infoList.view();
 
+    /// The certificate the server presented, as DER, put in `out`: what `ServerCertificate` or
+    /// `MsSqlConfig.setServerCertificate` would pin. False when the session is not encrypted (after a login-only
+    /// encryption, `Encrypt=false`).
+    public fn serverCertificate(borrow this, out: borrow mut Vector<u8>) -> Result<bool, MsSqlError> {
+        out.clear();
+        match (borrow this.tls) {
+            Some(engine) => { return tlsResult(engine.peerCertificate(out)); }
+            null => { return Ok(false); }
+        }
+    }
+
     /// Whether the server still holds this idle connection: one the server, a failover or a middlebox closed has
     /// its end of stream (or a reset) waiting, which a read finds at once. It never waits; it is false while an
     /// operation is under way or after one failed.
@@ -2270,4 +2332,16 @@ fn utf8Boundary(bytes: Slice<u8>) -> usize {
         back += 1;
     }
     return n;
+}
+
+/// With a pinned certificate (`pin` not empty), that the server presented exactly it.
+fn checkPin(engine: borrow TlsEngine, pin: Slice<u8>) -> Result<void, MsSqlError> {
+    if (pin.length == 0) {
+        return Ok();
+    }
+    var presented = Vector<u8>.create();
+    if (!tlsResult(engine.peerCertificate(mut presented))? || presented.view() != pin) {
+        return Err(MsSqlError.Tls(TlsError.Certificate));
+    }
+    return Ok();
 }

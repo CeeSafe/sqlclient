@@ -156,6 +156,18 @@ await db.finish()?;
 A value of gigabytes needs no more memory than a packet: a 16 MB `varbinary(max)` streams with the process at
 16 MB, as with `SELECT 1`. Skipping `readChunk` or `restOfRow` is fine; the next call passes over what is left.
 
+### Pinning the server's certificate
+
+```ceesafe
+// Connection string: ServerCertificate=/etc/sqlclient/db.cer (PEM, DER or CER). Or from bytes:
+var config = MsSqlConfig.parse("Server=db.internal;Database=shop;User Id=app;Password=…")?;
+config.setServerCertificate(pemOrDer)?;            // only this certificate is accepted, name and chain unchecked
+var db = await MsSqlConnection.connect(config)?;
+
+var der = Vector<u8>.create();
+let encrypted = db.serverCertificate(mut der)?;    // what a session got: save it to pin it next time
+```
+
 ### Transactions and server errors
 
 ```ceesafe
@@ -330,8 +342,8 @@ result set as tab-separated text, then the server's messages.
   `sqlserver://user:pass@host:port/instance?database=…` URLs.
   - Keys match as in ADO.NET, ignoring case and spaces. ADO.NET keys that change nothing here (`Pooling`, `Enlist`,
     `Persist Security Info`, …) are accepted. Those that ask for a feature this client lacks
-    (`MultipleActiveResultSets=true`, `Column Encryption Setting=Enabled`, `Failover Partner`, `ServerCertificate`,
-    named pipes) fail with `MsSqlError.Unsupported`, and `Authentication=ActiveDirectory…` with
+    (`MultipleActiveResultSets=true`, `Column Encryption Setting=Enabled`, `Failover Partner`, named pipes) fail with
+    `MsSqlError.Unsupported`, and `Authentication=ActiveDirectory…` with
     `UnsupportedAuthentication`. A key ADO.NET does not have fails with `Config`, as its "Keyword not supported".
   - The server is `host`, `host,port`, `tcp:host,port`, `[v6],port`, or `host\instance`; a named instance's port is
     asked of SQL Server Browser (UDP 1434).
@@ -347,6 +359,9 @@ result set as tab-separated text, then the server's messages.
   - `Encrypt=strict` is TDS 8.0: TLS first, ALPN `tds/8.0`.
   - The server's certificate is checked against the system roots and the host name (or `HostNameInCertificate`),
     unless `TrustServerCertificate=true`.
+  - `ServerCertificate=<file>` (PEM, DER or CER), or `config.setServerCertificate(bytes)`, pins the certificate:
+    the server must present exactly it, which suits a self-signed certificate better than trusting any.
+    `db.serverCertificate(mut der)` gives the one a session got, to pin on first use.
   - TLS is OpenSSL 3 through the `tls` package's `TlsEngine`; each TDS packet goes in a TLS record of its own, as
     SQL Server requires.
 - **Logins.** SQL logins, and Windows logins with NTLMv2 (`Integrated Security=true` or `Domain=…`, with a user name
@@ -363,7 +378,9 @@ result set as tab-separated text, then the server's messages.
   - the integer types, `bit`, `float`/`real`, `decimal(38, s)`, `money`;
   - `nvarchar(4000)`/`(max)`, `varchar` in the server's code page (to match `varchar` columns' indexes),
     `varbinary`;
-  - `uniqueidentifier`, `date`, `time(7)`, `datetime2(7)`, `datetimeoffset(7)`, legacy `datetime`;
+  - `uniqueidentifier`, `date`, `time(7)`, `datetime2(7)`, `datetimeoffset(7)` (or another scale, with
+    `timeWithScale`, `dateTimeWithScale`, `dateTimeOffsetWithScale`), legacy `datetime` and `smalldatetime`;
+  - `xml`;
   - typed NULLs.
 
   Unnamed values are `@p1`, `@p2`, …; `params.name("@id")` names the next one. Names are checked, since they go into
@@ -373,6 +390,9 @@ result set as tab-separated text, then the server's messages.
   - Getters decode where they are called: `text`, `bytes`, `int64`, `int32`, `bool`, `float64`, `decimal`
     (`MsDecimal`, exact to 38 digits), `guid`, `dateTime` (`MsDateTime`, 100 ns, with the offset).
   - `writeValue` gives any value as text; `writeJson` and `writeMarkdown` give the whole result.
+  - `describeResult(sql, params)` describes a query's result without running it, as `GetSchemaTable` with
+    `KeyInfo`: each column's type, nullability, source table and column, identity and key flags, and the hidden key
+    columns that tell rows apart.
   - Every SQL Server type is read, `sql_variant`, `xml`, CLR types (as bytes) and the old `text`/`ntext`/`image`
     included.
 - **Streaming.** For results too large to hold:
@@ -435,7 +455,8 @@ Bugs and bottlenecks in the C# driver that this port does not carry over:
 
 - The ADO.NET (`DbConnection`) and Entity Framework Core surfaces, and `QueryAsync<T>`'s reflection mapping.
   CeeSafe has no reflection; read cells with the typed getters.
-- Kerberos and Entra ID (Azure AD) logins, Always Encrypted, MARS, the UTF-8 feature extension, and the
+- Kerberos and Entra ID (Azure AD) logins, Always Encrypted, MARS, `sql_variant`, CLR type and fixed `char`
+  parameters (send `nvarchar` or `varbinary`, which the server converts), the UTF-8 feature extension, and the
   double-byte code pages (932, 936, 949, 950) for `varchar` (they read as U+FFFD past ASCII).
 - Session recovery: a connection outside a pool that the server closes while idle fails its next call (`Closed` or
   `Io`) instead of reconnecting with its session restored. A pool replaces such connections.
@@ -464,7 +485,9 @@ The live tests (checked against SQL Server 2025) cover:
   after a `KILL`, transient login errors retried, and `FOR JSON`;
 - table-valued parameters and bulk copies of fourteen column types, NULLs, defaults, 20,000 rows, and a refused load;
 - a batch of 102 commands (inserts, two result sets, a procedure's output), and one with a failing command inside;
-- a 6 MB `nvarchar(max)` of emoji streamed as UTF-8 with every character whole, a NULL, a skipped value.
+- a 6 MB `nvarchar(max)` of emoji streamed as UTF-8 with every character whole, a NULL, a skipped value;
+- scaled `time`/`datetime2`/`datetimeoffset`, `smalldatetime` and `xml` parameters, a join's result described with
+  its source tables and keys, and a pinned certificate accepted (from bytes and from a file) and a wrong one refused.
 
 ## Benchmarks
 

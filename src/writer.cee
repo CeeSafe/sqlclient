@@ -165,9 +165,26 @@ fn putParam(
     if (k == P_VARBINARY) {
         return putBytesValue(out, 0xA5, v, session, p.isNull);
     }
-    if (k == P_DATE || k == P_TIME || k == P_DATETIME2 || k == P_DATETIMEOFFSET || k == P_DATETIME) {
-        allocated(putTemporalTypeInfo(out, k))?;
-        return putTemporalValue(out, k, v, p.isNull);
+    if (k == P_DATE || k == P_TIME || k == P_DATETIME2 || k == P_DATETIMEOFFSET || k == P_DATETIME ||
+        k == P_SMALLDATETIME) {
+        allocated(putTemporalTypeInfo(out, k, p.scale))?;
+        return putTemporalValue(out, k, v, p.isNull, p.scale);
+    }
+    if (k == P_XML) {
+        // XML: no schema collection, the text as UTF-16 PLP.
+        allocated(out.push(0xF1))?;
+        allocated(out.push(0))?;
+        if (p.isNull) {
+            return allocated(out.pushLE(0xFFFFFFFFFFFFFFFFu64));
+        }
+        scratch.clear();
+        allocated(Utf16.encode(StringView.fromUtf8(v) ?? "", scratch))?;
+        allocated(out.pushLE(scratch.length as u64))?;
+        if (scratch.length > 0) {
+            allocated(out.pushLE(truncate<u32>(scratch.length)))?;
+            allocated(out.extend(scratch.view()))?;
+        }
+        return allocated(out.pushLE(0u32));
     }
     if (k == P_TABLE) {
         return putTableValue(out, params, p, session, scratch);
@@ -175,38 +192,61 @@ fn putParam(
     return Err(MsSqlError.Config);
 }
 
-/// The TYPE_INFO of a date or time kind: `date`, `time(7)`, `datetime2(7)`, `datetimeoffset(7)`, `datetime`.
-fn putTemporalTypeInfo(out: borrow mut Vector<u8>, k: u8) -> Result<void, AllocError> {
+/// The TYPE_INFO of a date or time kind: `date`, `time(s)`, `datetime2(s)`, `datetimeoffset(s)`, `datetime`,
+/// `smalldatetime`.
+fn putTemporalTypeInfo(out: borrow mut Vector<u8>, k: u8, scale: u8) -> Result<void, AllocError> {
     if (k == P_DATE) {
         return out.push(0x28);
     }
-    if (k == P_DATETIME) {
+    if (k == P_DATETIME || k == P_SMALLDATETIME) {
         out.push(0x6F)?;
-        return out.push(8);
+        return out.push(if (k == P_DATETIME) 8u8 else 4u8);
     }
     out.push(if (k == P_TIME) 0x29u8 else (if (k == P_DATETIME2) 0x2Au8 else 0x2Bu8))?;
-    return out.push(7);
+    return out.push(scale);
 }
 
-/// A date or time value of kind `k`, from dateParts: days (4), 100 ns units (8), offset minutes (2).
-fn putTemporalValue(out: borrow mut Vector<u8>, k: u8, v: Slice<u8>, isNull: bool) -> Result<void, MsSqlError> {
+/// The bytes of a time of scale `scale`: 3 up to 2, 4 up to 4, else 5.
+fn timeBytes(scale: u8) -> usize => if (scale <= 2) 3usize else (if (scale <= 4) 4usize else 5usize);
+
+/// `ticks` (100 ns units) in units of scale `scale` (10^-scale seconds), the finer digits dropped.
+fn scaledTicks(ticks: u64, scale: u8) -> u64 {
+    var t = ticks;
+    var s = scale;
+    while (s < 7) {
+        t = t / 10;
+        s += 1;
+    }
+    return t;
+}
+
+/// A date or time value of kind `k` and scale `scale`, from dateParts: days (4), 100 ns units (8), offset minutes
+/// (2).
+fn putTemporalValue(
+    out: borrow mut Vector<u8>,
+    k: u8,
+    v: Slice<u8>,
+    isNull: bool,
+    scale: u8,
+) -> Result<void, MsSqlError> {
     if (isNull) {
         return allocated(out.push(0));
     }
     let days = v.readLE<u32>(0) as u64;
     let ticks = v.readLE<u64>(4);
     let offset = v.readLE<i16>(12) as i64;
+    let tb = timeBytes(scale);
     if (k == P_DATE) {
         allocated(out.push(3))?;
         return putLittle(out, days, 3);
     }
     if (k == P_TIME) {
-        allocated(out.push(5))?;
-        return putLittle(out, ticks, 5);
+        allocated(out.push(truncate<u8>(tb)))?;
+        return putLittle(out, scaledTicks(ticks, scale), tb);
     }
     if (k == P_DATETIME2) {
-        allocated(out.push(8))?;
-        putLittle(out, ticks, 5)?;
+        allocated(out.push(truncate<u8>(tb + 3)))?;
+        putLittle(out, scaledTicks(ticks, scale), tb)?;
         return putLittle(out, days, 3);
     }
     if (k == P_DATETIMEOFFSET) {
@@ -224,10 +264,25 @@ fn putTemporalValue(out: borrow mut Vector<u8>, k: u8, v: Slice<u8>, isNull: boo
         if (day < 0) {
             return Err(MsSqlError.Config);
         }
-        allocated(out.push(10))?;
-        putLittle(out, truncate<u64>(utc), 5)?;
+        allocated(out.push(truncate<u8>(tb + 5)))?;
+        putLittle(out, scaledTicks(truncate<u64>(utc), scale), tb)?;
         putLittle(out, truncate<u64>(day), 3)?;
         return allocated(out.pushLE(truncate<i16>(offset)));
+    }
+    if (k == P_SMALLDATETIME) {
+        // Days since 1900, then minutes, rounded to the nearest (29.999 seconds and up rounds up).
+        var day = truncate<i64>(days) - DAYS_0001_TO_1900;
+        var minutes = (ticks + 299990000) / 600000000;
+        if (minutes >= 1440) {
+            minutes -= 1440;
+            day += 1;
+        }
+        if (day < 0 || day > 65535) {
+            return Err(MsSqlError.Config);
+        }
+        allocated(out.push(4))?;
+        allocated(out.pushLE(truncate<u16>(day)))?;
+        return allocated(out.pushLE(truncate<u16>(minutes)));
     }
     // datetime: days since 1900, then 1/300 seconds, rounded to the nearest.
     var day = truncate<i64>(days) - DAYS_0001_TO_1900;
@@ -316,14 +371,19 @@ fn appendDeclarations(params: borrow MsSqlParams, out: borrow mut Vector<u8>) ->
             out.extend("uniqueidentifier".bytes())?;
         } else if (k == P_DATE) {
             out.extend("date".bytes())?;
-        } else if (k == P_TIME) {
-            out.extend("time(7)".bytes())?;
-        } else if (k == P_DATETIME2) {
-            out.extend("datetime2(7)".bytes())?;
-        } else if (k == P_DATETIMEOFFSET) {
-            out.extend("datetimeoffset(7)".bytes())?;
+        } else if (k == P_TIME || k == P_DATETIME2 || k == P_DATETIMEOFFSET) {
+            out.extend(
+                if (k == P_TIME) "time(".bytes()
+                    else (if (k == P_DATETIME2) "datetime2(".bytes() else "datetimeoffset(".bytes()),
+            )?;
+            pad(out, p.scale as i64, 1)?;
+            out.push(')')?;
         } else if (k == P_DATETIME) {
             out.extend("datetime".bytes())?;
+        } else if (k == P_SMALLDATETIME) {
+            out.extend("smalldatetime".bytes())?;
+        } else if (k == P_XML) {
+            out.extend("xml".bytes())?;
         } else if (k == P_TABLE) {
             out.extend(v[8..])?; // the quoted type name
             out.extend(" READONLY".bytes())?;
@@ -475,7 +535,7 @@ fn putColumnTypeInfo(out: borrow mut Vector<u8>, c: MsTableColumn, session: Sess
         }
         return Ok();
     }
-    return putTemporalTypeInfo(out, k);
+    return putTemporalTypeInfo(out, k, c.scale);
 }
 
 /// The fixed-length type of a kind that has one (INT1/2/4/8, BIT, FLT4/8, MONEY, DATETIME), else 0.
@@ -591,7 +651,7 @@ fn putColumnValue(
         allocated(out.pushLE(truncate<u16>(bytes.length)))?;
         return allocated(out.extend(bytes));
     }
-    return putTemporalValue(out, k, v, isNull);
+    return putTemporalValue(out, k, v, isNull, c.scale);
 }
 
 /// Every row of `table`, each after `rowToken`, its values in column order.

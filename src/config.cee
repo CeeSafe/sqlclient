@@ -1,3 +1,4 @@
+import tls.TlsCertificates;
 import tls.TlsConfig;
 
 /// Whether and how a connection is encrypted, as `Encrypt` in a connection string.
@@ -60,6 +61,10 @@ public struct MsSqlConfig {
     private parallelConnect: bool;
     private retryCount: u8;
     private retryMillis: u64;
+    /// `ServerCertificate`: a file holding the one certificate the server may present.
+    private pinPath: String;
+    /// The pinned certificate as DER, when given as bytes.
+    private pinDer: Vector<u8>;
     private tlsConfig: TlsConfig?;
 
     fn empty() -> MsSqlConfig => MsSqlConfig {
@@ -88,6 +93,8 @@ public struct MsSqlConfig {
         parallelConnect: false,
         retryCount: 1,
         retryMillis: 10000,
+        pinPath: String.create(),
+        pinDer: Vector<u8>.create(),
         tlsConfig: null,
     };
 
@@ -155,11 +162,13 @@ public struct MsSqlConfig {
             let host = Environment.variable("HOSTNAME") ?? "localhost";
             allocated(this.workstationName.append(if (host.length > 0 && host.length <= 128) host else "localhost"))?;
         }
-        var tlsConfig = match (if (this.trustCertificate) TlsConfig.clientWithoutRoots() else TlsConfig.client()) {
+        // A pinned certificate replaces the chain and name checks: it is compared after the handshake.
+        let unchecked = this.trustCertificate || this.pinned();
+        var tlsConfig = match (if (unchecked) TlsConfig.clientWithoutRoots() else TlsConfig.client()) {
             Ok(t) => t,
             Err(e) => { return Err(MsSqlError.Tls(e)); }
         };
-        if (this.trustCertificate) {
+        if (unchecked) {
             tlsConfig.verifyPeer(false);
         }
         match (this.encryptMode) {
@@ -478,11 +487,15 @@ public struct MsSqlConfig {
             return Ok();
         }
         // Values that must be empty, or the feature's off value.
-        if (isKey(key, "failover partner") || isKey(key, "attach db filename") || isKey(key, "extended properties") ||
+        if (isKey(key, "server certificate")) {
+            return replaceText(mut this.pinPath, value);
+        }
+        let mustBeEmpty = isKey(key, "failover partner") || isKey(key, "attach db filename") ||
             isKey(
                 key,
-                "initial file name",
-            ) || isKey(key, "server certificate") || isKey(key, "enclave attestation url")) {
+                "extended properties",
+            ) || isKey(key, "initial file name") || isKey(key, "enclave attestation url");
+        if (mustBeEmpty) {
             return if (value.length == 0) Ok() else Err(MsSqlError.Unsupported);
         }
         if (isKey(key, "column encryption setting")) {
@@ -567,6 +580,55 @@ public struct MsSqlConfig {
     public fn setEncrypt(borrow mut this, mode: MsEncrypt) -> Result<void, MsSqlError> {
         this.encryptMode = mode;
         return this.finish();
+    }
+
+    /// Accepts only the server certificate in `pemOrDer` (PEM or DER), as `ServerCertificate` does with a file:
+    /// instead of checking the chain and the name, a connection compares what the server presents with it, byte
+    /// for byte. For a server with a self-signed certificate, safer than `TrustServerCertificate`.
+    public fn setServerCertificate(borrow mut this, pemOrDer: Slice<u8>) -> Result<void, MsSqlError> {
+        match (TlsCertificates.der(pemOrDer, mut this.pinDer)) {
+            Ok() => {}
+            Err(e) => { return Err(MsSqlError.Tls(e)); }
+        }
+        this.pinPath.clear();
+        return this.finish();
+    }
+
+    /// Whether a certificate is pinned (`ServerCertificate` or `setServerCertificate`).
+    public fn pinned(borrow this) -> bool => this.pinDer.length > 0 || this.pinPath.length > 0;
+
+    /// The pinned certificate as DER into `out`, read from the `ServerCertificate` file if needed; empty when none.
+    async fn loadPin(borrow this, out: borrow mut Vector<u8>) -> Result<void, MsSqlError> {
+        out.clear();
+        if (this.pinDer.length > 0) {
+            return allocated(out.extend(this.pinDer.view()));
+        }
+        if (this.pinPath.length == 0) {
+            return Ok();
+        }
+        var file = match (await AsyncFiles.openRegular(this.pinPath.view())) {
+            Ok(f) => f,
+            Err(e) => { return Err(MsSqlError.Io(e)); }
+        };
+        var bytes = Vector<u8>.create();
+        var buffer = [0u8; 4096];
+        loop {
+            let n = match (await AsyncFiles.read(mut file, mut buffer[..])) {
+                Ok(n) => n,
+                Err(e) => { return Err(MsSqlError.Io(e)); }
+            };
+            if (n == 0) {
+                break;
+            }
+            if (bytes.length + n > 1048576) {
+                return Err(MsSqlError.TooLarge);
+            }
+            allocated(bytes.extend(buffer[0..n]))?;
+        }
+        match (TlsCertificates.der(bytes.view(), out)) {
+            Ok() => { return Ok(); }
+            Err(e) => { return Err(MsSqlError.Tls(e)); }
+        }
     }
 
     /// Trusts the server's certificate without checking it, as `TrustServerCertificate=true`: for development

@@ -283,7 +283,8 @@ fn adoNetKeysAreKnownOrRefused() -> Result<void, TestFailure> {
     Check.equalText("unsupported", parseOutcome("Server=a;Column Encryption Setting=Enabled"))?;
     Check.equalText("unsupported", parseOutcome("Server=a;Failover Partner=b"))?;
     Check.equalText("unsupported", parseOutcome("Server=a;AttachDBFilename=|DataDirectory|\\x.mdf"))?;
-    Check.equalText("unsupported", parseOutcome("Server=a;ServerCertificate=/etc/ssl/sql.cer"))?;
+    Check.equalText("ok", parseOutcome("Server=a;ServerCertificate=/etc/ssl/sql.cer"))?; // read when connecting
+    Check.isTrue(MsSqlConfig.parse("Server=a;ServerCertificate=/etc/ssl/sql.cer")!.pinned(), "pinned")?;
     Check.equalText("unsupported", parseOutcome("Server=a;User Instance=true"))?;
     Check.equalText("unsupported", parseOutcome("Server=np:\\\\.\\pipe\\sql"))?;
     Check.equalText("unsupported", parseOutcome("Server=a;Network Library=dbnmpntw"))?;

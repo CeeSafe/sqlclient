@@ -1318,6 +1318,170 @@ fn largeValuesStream() -> Result<void, TestFailure> {
     return report(Async.run(streamedValues(config)));
 }
 
+async fn moreTypesAndShapes(config: borrow MsSqlConfig) -> Outcome {
+    var db = match (await MsSqlConnection.connect(config)) {
+        Ok(c) => c,
+        Err(e) => { return connectFailed(e); }
+    };
+    let at = MsDateTime.of(2026, 11, 15, 9, 30, 40, 123456700);
+    var p = MsSqlParams.create();
+    let _ = p.timeWithScale(at, 0);
+    let _ = p.dateTimeWithScale(at, 3);
+    let _ = p.dateTimeOffsetWithScale(at.withOffset(60), 2);
+    let _ = p.smallDateTime(at);
+    let _ = p.xml("<a x='42'><b>ünï</b></a>");
+    let sql = """
+        SELECT CONVERT(varchar(30), @p1, 114), CAST(SQL_VARIANT_PROPERTY(@p1, 'Scale') AS int),
+               CONVERT(varchar(30), @p2, 121), CAST(SQL_VARIANT_PROPERTY(@p2, 'Scale') AS int),
+               CONVERT(varchar(40), @p3, 127), CAST(SQL_VARIANT_PROPERTY(@p4, 'BaseType') AS varchar(20)),
+               CONVERT(varchar(20), @p4, 120), @p5.value('(/a/@x)[1]', 'int'), @p5.value('(/a/b)[1]', 'nvarchar(10)')
+        """;
+    match (await db.query(sql, p)) {
+        Ok(r) => {
+            if (r.text(0, 0) != Some("09:30:40") || r.int64(0, 1) != Some(0i64)) {
+                return wrong("time(0)");
+            }
+            if (r.text(0, 2) != Some("2026-11-15 09:30:40.123") || r.int64(0, 3) != Some(3i64)) {
+                return wrong("datetime2(3)");
+            }
+            if (r.text(0, 4) != Some("2026-11-15T08:30:40.12Z")) { // style 127 is UTC
+                return wrong("datetimeoffset(2)");
+            }
+            if (r.text(0, 5) != Some("smalldatetime") || r.text(0, 6) != Some("2026-11-15 09:31:00")) {
+                return wrong("smalldatetime, rounded to the minute");
+            }
+            if (r.int64(0, 7) != Some(42i64) || r.text(0, 8) != Some("ünï")) {
+                return wrong("xml");
+            }
+        }
+        Err(e) => { return failed(e, db); }
+    }
+    // The shape of a join's result, without running it.
+    match (await db.batch("CREATE TABLE #parent (id int IDENTITY PRIMARY KEY, name nvarchar(40) NOT NULL); CREATE TABLE #child (cid int PRIMARY KEY, parent int, note nvarchar(10))")) {
+        Ok(_) => {}
+        Err(e) => { return failed(e, db); }
+    }
+    var q = MsSqlParams.create();
+    let _ = q.int32(1);
+    match (await db.describeResult("SELECT p.name, c.note FROM #parent p JOIN #child c ON c.parent = p.id WHERE p.id = @p1", q)) {
+        Ok(shape) => {
+            let name = shape.columnIndex("name")!;
+            let table = shape.columnIndex("source_table")!;
+            let hidden = shape.columnIndex("is_hidden")!;
+            let identity = shape.columnIndex("is_identity_column")!;
+            if (shape.rowCount() < 4 || shape.text(0, name) != Some("name") || shape.text(1, name) != Some("note")) {
+                return wrong("two columns asked for, and the keys added");
+            }
+            if (shape.bool(0, hidden) != Some(false) || shape.bool(shape.rowCount() - 1, hidden) != Some(true)) {
+                return wrong("hidden key columns at the end");
+            }
+            var sawIdentity = false;
+            for (r in 0..shape.rowCount()) {
+                // A temporary table comes back by its internal name, #parent___…0002BB4.
+                if (shape.bool(r, identity) == Some(true) && (shape.text(r, table) ?? "").startsWith("#parent")) {
+                    sawIdentity = true;
+                }
+            }
+            if (!sawIdentity) {
+                return wrong("#parent.id an identity column");
+            }
+        }
+        Err(e) => { return failed(e, db); }
+    }
+    return passed();
+}
+
+@test
+fn moreParameterTypesAndResultShapes() -> Result<void, TestFailure> {
+    let config = match (testConfig()) {
+        Some(c) => c,
+        null => { return Ok(); }
+    };
+    return report(Async.run(moreTypesAndShapes(config)));
+}
+
+async fn pinning(text: StringView) -> Outcome {
+    // The certificate the server presents, from a connection that trusts it.
+    let trusting = match (MsSqlConfig.parse(text)) {
+        Ok(c) => c,
+        Err(e) => { return connectFailed(e); }
+    };
+    var der = Vector<u8>.create();
+    {
+        var db = match (await MsSqlConnection.connect(trusting)) {
+            Ok(c) => c,
+            Err(e) => { return connectFailed(e); }
+        };
+        match (db.serverCertificate(mut der)) {
+            Ok(true) => {}
+            _ => { return wrong("an encrypted session's certificate"); }
+        }
+    }
+    // Pinned to it, from bytes: the connection succeeds without trusting anything else.
+    var full = String.create();
+    let _ = full.append(text);
+    let _ = full.append(";TrustServerCertificate=false");
+    var pinned = match (MsSqlConfig.parse(full.view())) {
+        Ok(c) => c,
+        Err(e) => { return connectFailed(e); }
+    };
+    match (pinned.setServerCertificate(der.view())) {
+        Ok() => {}
+        Err(e) => { return connectFailed(e); }
+    }
+    match (await MsSqlConnection.connect(pinned)) {
+        Ok(_) => {}
+        Err(e) => { return connectFailed(e); }
+    }
+    // From a file, as ServerCertificate=path.
+    let path = "out/sqlclient-pin-test.der";
+    match (await AsyncFiles.create(path)) {
+        Ok(f) => {
+            var file = f;
+            let _ = await AsyncFiles.write(mut file, der.view());
+        }
+        Err(e) => { return connectFailed(MsSqlError.Io(e)); }
+    }
+    var withPath = String.create();
+    let _ = withPath.append(full.view());
+    let _ = withPath.append(";ServerCertificate=");
+    let _ = withPath.append(path);
+    match (MsSqlConfig.parse(withPath.view())) {
+        Ok(c) => {
+            match (await MsSqlConnection.connect(c)) {
+                Ok(_) => {}
+                Err(e) => { return connectFailed(e); }
+            }
+        }
+        Err(e) => { return connectFailed(e); }
+    }
+    // Pinned to another certificate: refused, though TrustServerCertificate would have let it in.
+    var other = Vector<u8>.create();
+    let _ = other.extend(der.view());
+    other[other.length - 1] = other[other.length - 1] ^ 0xFF;
+    var wrongPin = match (MsSqlConfig.parse(text)) {
+        Ok(c) => c,
+        Err(e) => { return connectFailed(e); }
+    };
+    if (wrongPin.setServerCertificate(other.view()).isOk()) {
+        match (await MsSqlConnection.connect(wrongPin)) {
+            Ok(_) => { return wrong("a certificate that is not the pinned one refused"); }
+            Err(MsSqlError.Tls(_)) => {}
+            Err(e) => { return connectFailed(e); }
+        }
+    }
+    return passed();
+}
+
+@test
+fn serverCertificatesPin() -> Result<void, TestFailure> {
+    let text = match (Environment.variable("MSSQL_TEST_CONNECTION")) {
+        Some(t) => t,
+        null => { return Ok(); }
+    };
+    return report(Async.run(pinning(text)));
+}
+
 async fn json(config: borrow MsSqlConfig) -> Outcome {
     var db = match (await MsSqlConnection.connect(config)) {
         Ok(c) => c,

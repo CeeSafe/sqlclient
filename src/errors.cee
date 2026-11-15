@@ -17,7 +17,7 @@ public enum MsSqlError {
     /// Kerberos, Entra ID).
     UnsupportedAuthentication,
     /// The connection string asks for a feature this client does not have: MARS, Always Encrypted, a failover
-    /// partner, `ServerCertificate`, `AttachDBFilename`, a user instance, a transport other than TCP.
+    /// partner, `AttachDBFilename`, a user instance, a transport other than TCP.
     Unsupported,
     /// The server reported one or more errors; `MsSqlConnection.errors()` has them, `lastError()` the first. The
     /// connection is usable again.

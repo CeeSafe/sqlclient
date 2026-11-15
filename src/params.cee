@@ -25,6 +25,8 @@ const P_MONEY: u8 = 17;
 const P_DATETIME: u8 = 18;
 /// A table-valued parameter: `at` is its index in `MsSqlParams.tables`.
 const P_TABLE: u8 = 19;
+const P_SMALLDATETIME: u8 = 20;
+const P_XML: u8 = 21;
 
 struct MsParam {
     nameAt: usize;
@@ -318,6 +320,47 @@ public struct MsSqlParams {
         return this.add(P_DATETIMEOFFSET, b[..], 7, false);
     }
 
+    /// A `time(scale)`: scale 0 to 7 digits of a second (the finer ones are dropped), as a `time(0)` column
+    /// declares it, so that comparing with it needs no conversion.
+    public fn timeWithScale(borrow mut this, value: MsDateTime, scale: u8) -> Result<void, MsSqlError> {
+        if (scale > 7 || !value.hasTime || !value.isValid()) {
+            return this.refuse();
+        }
+        let b = dateParts(value);
+        return this.add(P_TIME, b[..], scale, false);
+    }
+
+    /// A `datetime2(scale)` (see `timeWithScale`).
+    public fn dateTimeWithScale(borrow mut this, value: MsDateTime, scale: u8) -> Result<void, MsSqlError> {
+        if (scale > 7 || !value.hasDate || !value.isValid()) {
+            return this.refuse();
+        }
+        let b = dateParts(value);
+        return this.add(P_DATETIME2, b[..], scale, false);
+    }
+
+    /// A `datetimeoffset(scale)` (see `timeWithScale`).
+    public fn dateTimeOffsetWithScale(borrow mut this, value: MsDateTime, scale: u8) -> Result<void, MsSqlError> {
+        if (scale > 7 || !value.hasDate || !value.isValid()) {
+            return this.refuse();
+        }
+        let b = dateParts(value);
+        return this.add(P_DATETIMEOFFSET, b[..], scale, false);
+    }
+
+    /// A `smalldatetime`, to the nearest minute, from 1900-01-01 to 2079-06-06.
+    public fn smallDateTime(borrow mut this, value: MsDateTime) -> Result<void, MsSqlError> {
+        if (!value.hasDate || !value.isValid() || value.year < 1900 || value.year > 2079) {
+            return this.refuse();
+        }
+        let b = dateParts(value);
+        return this.add(P_SMALLDATETIME, b[..], 0, false);
+    }
+
+    /// An `xml` document or fragment; the server checks it is well formed.
+    public fn xml(borrow mut this, value: StringView) -> Result<void, MsSqlError> =>
+        this.add(P_XML, value.bytes(), 0, false);
+
     /// SQL NULL declared as `sqlType` (`MsSqlType.NVarChar`, `MsSqlType.Int`, …). The character, binary and decimal
     /// types are declared at their largest, the temporal ones at scale 7.
     public fn nullOf(borrow mut this, sqlType: MsSqlType) -> Result<void, MsSqlError> {
@@ -343,12 +386,18 @@ public struct MsSqlParams {
             MsSqlType.Date => P_DATE,
             MsSqlType.Time => P_TIME,
             MsSqlType.DateTime => P_DATETIME,
-            MsSqlType.SmallDateTime => P_DATETIME,
+            MsSqlType.SmallDateTime => P_SMALLDATETIME,
+            MsSqlType.Xml => P_XML,
             MsSqlType.DateTime2 => P_DATETIME2,
             MsSqlType.DateTimeOffset => P_DATETIMEOFFSET,
             _ => P_NVARCHAR,
         };
-        return this.add(kind, [], if (kind == P_DECIMAL) 10u8 else 7u8, true);
+        return this.add(
+            kind,
+            [],
+            if (kind == P_DECIMAL) 10u8 else (if (kind == P_SMALLDATETIME || kind == P_XML) 0u8 else 7u8),
+            true,
+        );
     }
 
     /// A table-valued parameter of the user-defined table type `typeName` (`dbo.OrderLines`, `[sales].[Id List]`),
