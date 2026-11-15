@@ -31,7 +31,7 @@ if (scenario == "setup")
 
 await using var db = new SqlConnection(plain);
 await db.OpenAsync();
-if (scenario == "insert")
+if (scenario == "insert" || scenario == "batch")
 {
     await using var create = new SqlCommand("CREATE TABLE #bench_insert (id int, name nvarchar(100), amount decimal(18,2))", db);
     await create.ExecuteNonQueryAsync();
@@ -117,6 +117,22 @@ async Task<ulong> Once(string name, ulong i)
             }
             await tx.RollbackAsync();
             return Inserts;
+        }
+        case "batch":
+        {
+            await using var tx = (SqlTransaction)await db.BeginTransactionAsync();
+            await using var batch = new SqlBatch(db, tx);
+            for (var k = 0; k < Inserts; k++)
+            {
+                var command = new SqlBatchCommand("INSERT #bench_insert (id, name, amount) VALUES (@p1, @p2, @p3)");
+                command.Parameters.Add(new SqlParameter("@p1", SqlDbType.Int) { Value = k });
+                command.Parameters.Add(new SqlParameter("@p2", SqlDbType.NVarChar, 4000) { Value = "a row of the insert benchmark" });
+                command.Parameters.Add(new SqlParameter("@p3", SqlDbType.Decimal) { Precision = 38, Scale = 2, Value = 12345.67m });
+                batch.BatchCommands.Add(command);
+            }
+            var affected = await batch.ExecuteNonQueryAsync();
+            await tx.RollbackAsync();
+            return (ulong)affected;
         }
         case "bigvalue":
         {

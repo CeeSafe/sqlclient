@@ -191,6 +191,25 @@ var built = String.create();                       // FOR JSON, its pieces joine
 await db.queryJson("SELECT customer, total FROM #orders FOR JSON PATH", none, mut built)?;
 ```
 
+### Batches: many commands, one round trip
+
+```ceesafe
+var batch = MsSqlBatch.create();
+for (k in 0..100) {
+    var p = MsSqlParams.create();
+    p.int32(k)?;
+    p.text("click")?;
+    batch.add("INSERT dbo.events (id, kind) VALUES (@p1, @p2)", p)?;   // the batch keeps p
+}
+batch.addProcedure("dbo.refresh_totals", MsSqlParams.create())?;
+let results = await db.executeBatch(batch)?;       // one request instead of 101 round trips
+let inserted = results.affectedRows();
+let last = results.command(100);                   // each command's result sets, outputs and return status
+```
+
+A failing command does not stop the ones after it; the call then fails with `Server`, and `db.errors()` has every
+error.
+
 ### Table-valued parameters
 
 ```ceesafe
@@ -315,6 +334,8 @@ result set as tab-separated text, then the server's messages.
     changed, `batch` runs a parameterless script, `queryJson` joins a `FOR JSON` result.
   - `callProcedure(name, params)` calls a stored procedure with output parameters (`params.output()`) and gives its
     `RETURN` value.
+  - `executeBatch(batch)` sends a `MsSqlBatch` of statements and procedure calls, each with its own parameters, as
+    one request (SqlBatch), and gives each command's results.
 - **Parameters.** `MsSqlParams` sends each value typed, through `sp_executesql`, never spliced into SQL:
   - the integer types, `bit`, `float`/`real`, `decimal(38, s)`, `money`;
   - `nvarchar(4000)`/`(max)`, `varchar` in the server's code page (to match `varchar` columns' indexes),
@@ -415,7 +436,8 @@ The live tests (checked against SQL Server 2025) cover:
 - errors mid-result, transactions, and 200,000 streamed rows with an early cancel;
 - a command timeout answered by an attention, the pool's session reset and warm-up, a pooled connection replaced
   after a `KILL`, transient login errors retried, and `FOR JSON`;
-- table-valued parameters and bulk copies of fourteen column types, NULLs, defaults, 20,000 rows, and a refused load.
+- table-valued parameters and bulk copies of fourteen column types, NULLs, defaults, 20,000 rows, and a refused load;
+- a batch of 102 commands (inserts, two result sets, a procedure's output), and one with a failing command inside.
 
 ## Benchmarks
 
@@ -430,6 +452,7 @@ network). sqlclient used 2x to 58x less CPU per operation and about a sixth of t
 | 100,000 rows, six types | 60 ms | 118 ms | 17 MB vs 103 MB |
 | 1 MB `nvarchar(max)` round trip | 20 ms | 100 ms | 29 MB vs 154 MB |
 | 16 tasks × 25 queries through a pool | 22 ms | 196 ms | 18 MB vs 106 MB |
+| 100 INSERTs as one batch (`SqlBatch`) | 0.47 ms | 27.4 ms | 16 MB vs 94 MB |
 
 
 [`CEESAFE_FINDINGS.md`](CEESAFE_FINDINGS.md) lists the gaps and bugs in CeeSafe met during the port; all are fixed

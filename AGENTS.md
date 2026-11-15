@@ -76,7 +76,7 @@ run code in a sandbox. The specification is embedded in `ceesafec`, so its answe
   was deliberately changed from it; keep those fixes.
 - Layout: `config.cee` (connection strings), `connection.cee` (transport, TLS, packets, the token loop, every
   operation), `rows.cee` (COLMETADATA/ROW decoding and `MsSqlRows`), `params.cee` + `writer.cee` (RPC requests,
-  TVPs, bulk loads), `table.cee` (`MsSqlTable`),
+  TVPs, bulk loads), `table.cee` (`MsSqlTable`), `batch.cee` (`MsSqlBatch`),
   `login.cee` (PRELOGIN, LOGIN7, NTLM), `values.cee`, `text.cee` + `code_page_tables.cee`, `pool.cee`, `browser.cee`.
 - `examples/tour` holds README.md's examples: change both together, and run the tour against a server.
 - `benchmarks/` compares the package with Microsoft.Data.SqlClient (`benchmarks/README.md`).

@@ -3,6 +3,7 @@
 // Prints one `sample <nanoseconds>` line per timed iteration, then `check <value>` (a checksum of what was read,
 // which the .NET side must match).
 import sqlclient.MsSqlConfig;
+import sqlclient.MsSqlBatch;
 import sqlclient.MsSqlConnection;
 import sqlclient.MsSqlError;
 import sqlclient.MsSqlErrors;
@@ -117,6 +118,21 @@ async fn once(
         await db.rollback()?;
         return Ok(truncate<u64>(INSERTS));
     }
+    if (scenario == "batch") {
+        // The insert scenario's rows, sent as one batch.
+        await db.begin()?;
+        var b = MsSqlBatch.create();
+        for (k in 0..INSERTS) {
+            var p = MsSqlParams.create();
+            p.int32(k)?;
+            p.text("a row of the insert benchmark")?;
+            p.decimalText("12345.67")?;
+            b.add("INSERT #bench_insert (id, name, amount) VALUES (@p1, @p2, @p3)", p)?;
+        }
+        let results = await db.executeBatch(b)?;
+        await db.rollback()?;
+        return Ok(results.affectedRows());
+    }
     if (scenario == "bigvalue") {
         var p = MsSqlParams.create();
         p.text(big)?;
@@ -169,7 +185,7 @@ async fn run(
     }
     var db = await MsSqlConnection.connect(config)?;
     db.setCommandTimeout(0);
-    if (scenario == "insert") {
+    if (scenario == "insert" || scenario == "batch") {
         await db.batch("CREATE TABLE #bench_insert (id int, name nvarchar(100), amount decimal(18,2))")?;
     }
     let pool = MsSqlPool.create(MsSqlConfig.parse(Environment.variable("MSSQL_CONNECTION")!)?, POOL_TASKS as usize)?;

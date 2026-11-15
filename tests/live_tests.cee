@@ -1127,6 +1127,94 @@ fn transientLoginErrorsAreRetried() -> Result<void, TestFailure> {
     return Ok();
 }
 
+async fn batched(config: borrow MsSqlConfig) -> Outcome {
+    var db = match (await MsSqlConnection.connect(config)) {
+        Ok(c) => c,
+        Err(e) => { return connectFailed(e); }
+    };
+    match (await db.batch("CREATE TABLE #b (id int PRIMARY KEY, name nvarchar(20))")) {
+        Ok(_) => {}
+        Err(e) => { return failed(e, db); }
+    }
+    match (await db.batch("CREATE PROCEDURE #twice @n int, @r int OUTPUT AS BEGIN SET @r = @n * 2; RETURN 5; END")) {
+        Ok(_) => {}
+        Err(e) => { return failed(e, db); }
+    }
+    var batch = MsSqlBatch.create();
+    for (k in 0..100) {
+        var p = MsSqlParams.create();
+        let _ = p.int32(k);
+        let _ = p.text("row");
+        let _ = batch.add("INSERT #b (id, name) VALUES (@p1, @p2)", p);
+    }
+    let _ = batch.add("SELECT COUNT(*) FROM #b; SELECT TOP (2) id FROM #b ORDER BY id", MsSqlParams.create());
+    var call = MsSqlParams.create();
+    call.name("@n");
+    let _ = call.int32(21);
+    call.name("@r");
+    call.output();
+    let _ = call.nullOf(MsSqlType.Int);
+    let _ = batch.addProcedure("#twice", call);
+    let started = Clock.monotonicNanos();
+    let results = match (await db.executeBatch(batch)) {
+        Ok(r) => r,
+        Err(e) => { return failed(e, db); }
+    };
+    let elapsed = (Clock.monotonicNanos() - started) / 1000000;
+    if (results.count() != 102 || results.affectedRows() != 100 || results.command(0).affectedRows() != 1) {
+        return wrong("102 commands, 100 rows inserted");
+    }
+    let select = results.command(100);
+    if (select.count() != 2 || select.result(0).int64(0, 0) != Some(100i64) || select.result(1).rowCount() != 2) {
+        return wrong("a command's two result sets");
+    }
+    let proc = results.command(101);
+    if (proc.returnStatus() != Some(5i32) || proc.outputs().int64(0, 0) != Some(42i64)) {
+        return wrong("a procedure's output and status");
+    }
+    // A failing command in the middle: the others still run, and the call reports the error.
+    var bad = MsSqlBatch.create();
+    var p1 = MsSqlParams.create();
+    let _ = p1.int32(1000);
+    let _ = bad.add("INSERT #b (id, name) VALUES (@p1, N'x')", p1);
+    var p2 = MsSqlParams.create();
+    let _ = p2.int32(5);
+    let _ = bad.add("INSERT #b (id, name) VALUES (@p1, N'duplicate')", p2);
+    var p3 = MsSqlParams.create();
+    let _ = p3.int32(1001);
+    let _ = bad.add("INSERT #b (id, name) VALUES (@p1, N'y')", p3);
+    match (await db.executeBatch(bad)) {
+        Ok(_) => { return wrong("the duplicate key reported"); }
+        Err(MsSqlError.Server) => {
+            if (db.lastError()!.number != 2627) {
+                return wrong("error 2627");
+            }
+        }
+        Err(e) => { return failed(e, db); }
+    }
+    match (await db.query("SELECT COUNT(*) FROM #b", MsSqlParams.create())) {
+        Ok(r) => {
+            if (r.int64(0, 0) != Some(102i64)) {
+                return wrong("the commands around the failed one ran");
+            }
+        }
+        Err(e) => { return failed(e, db); }
+    }
+    if (elapsed > 5000) {
+        return wrong("one round trip, not 102");
+    }
+    return passed();
+}
+
+@test
+fn batchesRunInOneRequest() -> Result<void, TestFailure> {
+    let config = match (testConfig()) {
+        Some(c) => c,
+        null => { return Ok(); }
+    };
+    return report(Async.run(batched(config)));
+}
+
 async fn json(config: borrow MsSqlConfig) -> Outcome {
     var db = match (await MsSqlConnection.connect(config)) {
         Ok(c) => c,

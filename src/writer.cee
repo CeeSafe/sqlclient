@@ -345,10 +345,25 @@ fn putExecuteSql(
 ) -> Result<void, MsSqlError> {
     out.clear();
     allocated(putAllHeaders(out, descriptor))?;
+    return putExecuteSqlCall(out, sql, params, session, true);
+}
+
+/// The body of an RPC calling sp_executesql (after ALL_HEADERS): the statement, and the declarations and values
+/// when there are parameters or `declareAlways`.
+fn putExecuteSqlCall(
+    out: borrow mut Vector<u8>,
+    sql: StringView,
+    params: borrow MsSqlParams,
+    session: SessionText,
+    declareAlways: bool,
+) -> Result<void, MsSqlError> {
     allocated(out.pushLE(0xFFFFu16))?; // a procedure by id
     allocated(out.pushLE(PROC_EXECUTESQL))?;
     allocated(out.pushLE(0u16))?; // option flags
     putUnnamedText(out, sql, session)?;
+    if (params.count() == 0 && !declareAlways) {
+        return Ok();
+    }
     var declarations = Vector<u8>.create();
     allocated(appendDeclarations(params, mut declarations))?;
     putUnnamedText(out, StringView.fromUtf8(declarations.view()) ?? "", session)?;
@@ -368,17 +383,51 @@ fn putProcedureCall(
     session: SessionText,
 ) -> Result<void, MsSqlError> {
     out.clear();
+    allocated(putAllHeaders(out, descriptor))?;
+    return putProcedureBody(out, name, params, session);
+}
+
+/// The body of an RPC calling stored procedure `name` (after ALL_HEADERS).
+fn putProcedureBody(
+    out: borrow mut Vector<u8>,
+    name: StringView,
+    params: borrow MsSqlParams,
+    session: SessionText,
+) -> Result<void, MsSqlError> {
     let units = Utf16.encodedLength(name) / 2;
     if (units == 0 || units > 0xFFFE) {
         return Err(MsSqlError.Config);
     }
-    allocated(putAllHeaders(out, descriptor))?;
     allocated(out.pushLE(truncate<u16>(units)))?;
     allocated(Utf16.encode(name, out))?;
     allocated(out.pushLE(0u16))?; // option flags
     var scratch = Vector<u8>.create();
     for (p in params.entryList()) {
         putParam(out, params, p, session, mut scratch)?;
+    }
+    return Ok();
+}
+
+/// One RPC message holding every command of `batch`, separated by BatchFlag (MS-TDS 2.2.6.6, TDS 7.2+).
+fn putBatch(
+    out: borrow mut Vector<u8>,
+    batch: borrow MsSqlBatch,
+    descriptor: u64,
+    session: SessionText,
+) -> Result<void, MsSqlError> {
+    out.clear();
+    allocated(putAllHeaders(out, descriptor))?;
+    var first = true;
+    for (command in batch.commandList()) {
+        if (!first) {
+            allocated(out.push(0xFF))?;
+        }
+        first = false;
+        if (command.procedure) {
+            putProcedureBody(out, command.text.view(), borrow command.params, session)?;
+        } else {
+            putExecuteSqlCall(out, command.text.view(), borrow command.params, session, false)?;
+        }
     }
     return Ok();
 }

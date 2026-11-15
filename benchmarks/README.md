@@ -23,6 +23,7 @@ The connection string is read from the environment only; never write it into a f
 | `param` | `SELECT id, name … WHERE id = @p1` with an `int` parameter |
 | `rows` | every value of 100,000 rows, read as its type (MDS with `SequentialAccess`; sqlclient streams 4,096-row batches) |
 | `insert` | 100 parameterized `INSERT`s into a temporary table in a transaction, rolled back |
+| `batch` | the same 100 `INSERT`s as one batch: `MsSqlBatch`, and MDS's `SqlBatch` |
 | `bigvalue` | a 1 MB `nvarchar(max)` parameter sent and read back |
 | `json` | `FOR JSON PATH` over 10,000 rows, the pieces joined into one string |
 | `pool` | 16 tasks at once, each leasing a connection 25 times from a pool of 16 and running `SELECT 1` |
@@ -50,6 +51,7 @@ Server 2025 about 98 ms away (ping), TLS for the login only. Three rounds; media
 | `param` | 109 ms | 102 ms | 0.17 ms | 9.98 ms | 58x | 15 MB | 98 MB |
 | `rows` | 454 ms | 448 ms | 59.87 ms | 118.20 ms | 2x | 17 MB | 103 MB |
 | `insert` | 10716 ms | 10734 ms | 15.28 ms | 77.02 ms | 5x | 15 MB | 92 MB |
+| `batch` | 352 ms | 341 ms | 0.47 ms | 27.37 ms | 58x | 16 MB | 94 MB |
 | `bigvalue` | 612 ms | 630 ms | 20.10 ms | 99.61 ms | 5x | 29 MB | 154 MB |
 | `json` | 231 ms | 170 ms | 6.60 ms | 36.81 ms | 6x | 18 MB | 106 MB |
 | `pool` | 3062 ms | 3098 ms | 22.34 ms | 195.60 ms | 9x | 18 MB | 106 MB |

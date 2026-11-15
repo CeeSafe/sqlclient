@@ -1,0 +1,80 @@
+// Several commands sent in one request (SqlBatch): one round trip for all of them.
+
+@noncopy
+struct MsBatchCommand {
+    text: String;
+    params: MsSqlParams;
+    procedure: bool;
+}
+
+/// Commands that `MsSqlConnection.executeBatch` sends together, as one request: each is a statement with its own
+/// parameters (through `sp_executesql`) or a stored procedure call, run in order, with one round trip for all.
+///
+/// ```ceesafe
+/// var batch = MsSqlBatch.create();
+/// for (k in 0..100) {
+///     var p = MsSqlParams.create();
+///     p.int32(k)?;
+///     p.text("a row")?;
+///     batch.add("INSERT dbo.events (id, kind) VALUES (@p1, @p2)", p)?;
+/// }
+/// let results = await db.executeBatch(batch)?;     // 100 inserts, one round trip
+/// let first = results.command(0).affectedRows();
+/// ```
+@noncopy
+public struct MsSqlBatch {
+    private commands: Vector<MsBatchCommand>;
+
+    /// No commands yet.
+    public fn create() -> MsSqlBatch => MsSqlBatch { commands: Vector<MsBatchCommand>.create() };
+
+    /// Adds statement `sql` with `params` (its `@p1`, … or named values), which the batch keeps.
+    public fn add(borrow mut this, sql: StringView, params: MsSqlParams) -> Result<void, MsSqlError> =>
+        this.push(sql, params, false);
+
+    /// Adds a call of stored procedure `name` with `params`, as `callProcedure` makes.
+    public fn addProcedure(borrow mut this, name: StringView, params: MsSqlParams) -> Result<void, MsSqlError> =>
+        this.push(name, params, true);
+
+    fn push(borrow mut this, text: StringView, params: MsSqlParams, procedure: bool) -> Result<void, MsSqlError> {
+        if (text.trim().length == 0) {
+            return Err(MsSqlError.Config);
+        }
+        var owned = String.create();
+        allocated(owned.append(text))?;
+        return allocated(this.commands.push(MsBatchCommand { text: owned, params: params, procedure: procedure }));
+    }
+
+    /// How many commands.
+    public fn count(borrow this) -> usize => this.commands.length;
+
+    /// Removes every command, keeping the memory.
+    public fn clear(borrow mut this) {
+        this.commands.clear();
+    }
+
+    fn commandList(borrow this) -> Slice<MsBatchCommand> => this.commands.view();
+}
+
+/// What each command of a `MsSqlBatch` gave, in order.
+@noncopy
+public struct MsSqlBatchResults {
+    private commands: Vector<MsSqlResults>;
+
+    fn of(commands: Vector<MsSqlResults>) -> MsSqlBatchResults => MsSqlBatchResults { commands: commands };
+
+    /// How many commands ran.
+    public fn count(borrow this) -> usize => this.commands.length;
+
+    /// Command `i`'s result sets, output parameters, return status and rows affected.
+    public fn command(borrow this, i: usize) -> borrow MsSqlResults => borrow this.commands[i];
+
+    /// The rows every command affected, together.
+    public fn affectedRows(borrow this) -> u64 {
+        var total: u64 = 0;
+        for (r in this.commands.view()) {
+            total += r.affectedRows();
+        }
+        return total;
+    }
+}

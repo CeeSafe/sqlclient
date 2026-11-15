@@ -1312,6 +1312,92 @@ public struct MsSqlConnection {
         return await this.collectResults(PKT_RPC);
     }
 
+    /// Runs every command of `batch` as one request, in order, and gives each one's results (SqlBatch). A command
+    /// that fails does not stop the ones after it, as the server runs each on its own; the call then fails with
+    /// `Server` once the response is read, and `errors()` has every error.
+    public async fn executeBatch(borrow mut this, batch: borrow MsSqlBatch) -> Result<MsSqlBatchResults, MsSqlError> {
+        this.ready()?;
+        if (batch.count() == 0) {
+            return Ok(MsSqlBatchResults.of(Vector<MsSqlResults>.create()));
+        }
+        putBatch(mut this.output, batch, this.descriptor, this.session)?;
+        this.busy = true;
+        let ms = this.commandMillis;
+        let outcome = if (ms == 0) await this.performBatch()
+            else await Async.timeout(ms, MsSqlError.TimedOut, async () => await this.performBatch());
+        match (outcome) {
+            Ok(r) => { return Ok(r); }
+            Err(MsSqlError.Server) => { return Err(MsSqlError.Server); }
+            Err(MsSqlError.TimedOut) => {
+                if (this.sending) {
+                    this.stream = S_IDLE;
+                } else {
+                    match (await this.recoverWithin()) {
+                        Ok() => {}
+                        Err(_) => { this.stream = S_IDLE; }
+                    }
+                }
+                return Err(MsSqlError.TimedOut);
+            }
+            Err(e) => {
+                this.stream = S_IDLE;
+                return Err(e);
+            }
+        }
+    }
+
+    /// Sends the batch and reads its response, closing a command's results at each DONEPROC.
+    async fn performBatch(borrow mut this) -> Result<MsSqlBatchResults, MsSqlError> {
+        await this.sendMessage(PKT_RPC)?;
+        this.beginResponse();
+        var done = Vector<MsSqlResults>.create();
+        var current = MsSqlResults.create();
+        var sets = Vector<MsSqlRows>.create();
+        var scratch = MsSqlRows.create();
+        var inSet = false;
+        loop {
+            let last = if (sets.length > 0) sets.length - 1 else 0usize;
+            let ev = if (inSet) await this.step(mut sets[last])? else await this.step(mut scratch)?;
+            if (ev == EV_ROW) {
+                if (!inSet) {
+                    scratch.clearRows();
+                }
+            } else if (ev == EV_COLUMNS) {
+                var set = MsSqlRows.create();
+                set.describe(borrow this.meta)?;
+                allocated(sets.push(set))?;
+                inSet = true;
+            } else if (ev == EV_DONE) {
+                let d = this.lastDone;
+                if ((d.status & DONE_COUNT) != 0) {
+                    if (d.command == CMD_SELECT) {
+                        if (inSet) {
+                            sets[last].setAffected(d.count);
+                        }
+                    } else if (d.token != 0xFE) {
+                        current.affected += d.count;
+                    }
+                }
+                inSet = false;
+                if (d.token == 0xFE) {
+                    // DONEPROC: this command is over.
+                    current.sets = replace(mut sets, Vector<MsSqlRows>.create());
+                    current.out = replace(mut this.outputs, MsSqlRows.create());
+                    current.status = this.status;
+                    this.status = null;
+                    allocated(done.push(replace(mut current, MsSqlResults.create())))?;
+                }
+            } else if (ev == EV_END) {
+                break;
+            }
+        }
+        this.busy = this.fatal;
+        if (this.errorList.length > 0) {
+            return Err(MsSqlError.Server);
+        }
+        return Ok(MsSqlBatchResults.of(done));
+    }
+
     /// Loads `rows` into table `table` (`dbo.Orders`, `[sales].[Order Lines]`, `#work`) as SqlBulkCopy does: an
     /// `INSERT BULK` naming `rows`' columns, then the rows in TDS's bulk format, far faster than one INSERT per row.
     /// Columns the table has and `rows` does not get their defaults. Gives how many rows the server took; a
