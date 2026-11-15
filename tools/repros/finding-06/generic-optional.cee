@@ -1,0 +1,11 @@
+struct Holder<T> {
+    fn some(v: T) -> T? => Some(v);
+}
+
+fn f() -> Result<void, u32> => Ok();
+
+fn main() {
+    let r = f();
+    let o = ResultMethods<void, u32>.ok(r);
+    Console.writeLine(o != null);
+}

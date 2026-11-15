@@ -1,0 +1,31 @@
+import sqlclient.MsSqlConfig;
+import sqlclient.MsSqlConnection;
+import sqlclient.MsSqlError;
+import sqlclient.MsSqlErrors;
+import sqlclient.MsSqlParams;
+
+async fn probe(config: borrow MsSqlConfig, chars: usize, binary: bool) -> Result<i64, MsSqlError> {
+    var db = await MsSqlConnection.connect(config)?;
+    var p = MsSqlParams.create();
+    if (binary) {
+        var b = Vector<u8>.create();
+        for (i in 0..chars) { let _ = b.push(truncate<u8>(i)); }
+        p.bytes(b.view())?;
+    } else {
+        var s = String.create();
+        for (i in 0..chars) { let _ = s.append("a"); }
+        p.text(s.view())?;
+    }
+    let rows = await db.query("SELECT DATALENGTH(@p1)", p)?;
+    return Ok(rows.int64(0, 0) ?? -1);
+}
+
+fn main() {
+    let config = MsSqlConfig.parse(Environment.variable("MSSQL_CONNECTION")!).ok()!;
+    let n = Process.argument(1)!.parseInt<usize>()!;
+    let binary = Process.argument(2) != null;
+    match (Async.run(probe(config, n, binary))) {
+        Ok(v) => { Console.writeLine(v); }
+        Err(e) => { Console.writeLine(MsSqlErrors.describe(e)); }
+    }
+}

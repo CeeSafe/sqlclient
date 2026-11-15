@@ -1,0 +1,4 @@
+fn main() {
+    var a = [1u8, 2, 3];
+    a.copyWithin(0, 2, 2);
+}

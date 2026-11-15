@@ -1,0 +1,26 @@
+fn dangling() {
+    var v: StringView = "static";
+    {
+        let s = String.from("temporary")!;
+        v = s.view();
+    }
+    Console.writeLine(v); // s is gone: must be refused
+}
+
+fn escaping() -> StringView {
+    let s = String.from("local")!;
+    var v: StringView = "static";
+    v = s.view();
+    return v; // a view of a local: must be refused
+}
+
+fn mutatedWhileViewed() {
+    var owner = String.from("abc")!;
+    var v: StringView = "x";
+    v = owner.view();
+    owner.append("d")!; // owner changes while v views it: must be refused
+    Console.writeLine(v);
+}
+
+
+fn main() {}

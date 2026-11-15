@@ -1,0 +1,23 @@
+fn show(s: Slice<u8>) {
+    for (b in s) {
+        Console.write(b);
+        Console.write(" ");
+    }
+    Console.writeLine("");
+}
+
+fn main() {
+    var a = [1u8, 2, 3, 4, 5, 6, 7, 8];
+    a.copyWithin(2, 0, 4);          // overlapping, forward source behind target
+    show(a[..]);                    // 1 2 1 2 3 4 7 8
+    var b = [1u8, 2, 3, 4, 5, 6, 7, 8];
+    b[..].copyWithin(0, 3, 5);      // overlapping the other way
+    show(b[..]);                    // 4 5 6 7 8 6 7 8
+    var v = Vector<u32>.create();
+    for (i in 0u32..6) {
+        v.push(i)!;
+    }
+    v.copyWithin(4, 0, 2);
+    v.viewMut().copyWithin(0, 1, 0);
+    Console.writeLine(v[0] + v[1] + v[4] + v[5]); // 0 + 1 + 4 + 5 = 10
+}

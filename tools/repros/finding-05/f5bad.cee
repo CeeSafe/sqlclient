@@ -1,0 +1,4 @@
+fn main() {
+    let a = [1u8, 2, 3];
+    a[..].copyWithin(0, 1, 1);
+}

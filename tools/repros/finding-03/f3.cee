@@ -1,0 +1,34 @@
+fn host(text: StringView) -> StringView {
+    var server = text.trim();
+    if (server.startsWith("tcp:")) {
+        server = server[4..].trim();
+    }
+    match (server.indexOf(",")) {
+        Some(comma) => { server = server[0..comma]; }
+        null => {}
+    }
+    return server;
+}
+
+fn tail(bytes: Slice<u8>) -> u32 {
+    var rest = bytes;
+    var total: u32 = 0;
+    while (rest.length > 0) {
+        total += rest[0] as u32;
+        rest = rest[1..];
+    }
+    return total;
+}
+
+fn main() {
+    Console.writeLine(host("  tcp: db.example.org ,1433"));
+    let b = [1u8, 2, 3, 4];
+    Console.writeLine(tail(b[..]));
+    var key = "";
+    for (word in "a,bb,ccc".split(",")) {
+        if (word.length > key.length) {
+            key = word;
+        }
+    }
+    Console.writeLine(key);
+}

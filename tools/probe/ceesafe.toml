@@ -1,0 +1,6 @@
+[package]
+name = "probe"
+kind = "executable"
+
+[dependencies]
+sqlclient = { path = "../.." }

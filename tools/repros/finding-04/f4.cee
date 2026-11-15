@@ -1,0 +1,5 @@
+struct Fields<region r> {
+    sspi: Slice<u8, r>;
+}
+
+fn main() {}

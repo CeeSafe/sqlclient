@@ -1,0 +1,38 @@
+enum Color {
+    Red,
+    Green,
+}
+
+fn find(v: i64) -> i64? => if (v > 0) Some(v) else null;
+
+fn word(v: i64) -> StringView? => if (v > 0) Some("yes") else null;
+
+fn color(v: i64) -> Color? => if (v > 0) Some(Color.Green) else null;
+
+fn nested(v: i64) -> i64?? {
+    let inner: i64? = if (v > 1) Some(v) else null;
+    if (v > 0) {
+        return Some(inner);
+    }
+    return null;
+}
+
+fn main() {
+    let a = find(3);
+    let b = find(3);
+    let n = find(-1);
+    Console.writeLine(a == Some(3i64));      // true
+    Console.writeLine(a != Some(4i64));      // true
+    Console.writeLine(a == b);               // true
+    Console.writeLine(a == n);               // false
+    Console.writeLine(n == find(-5));        // true: both null
+    Console.writeLine(n != a);               // true
+    Console.writeLine(word(1) == Some("yes")); // true
+    Console.writeLine(word(-1) == Some("yes")); // false
+    Console.writeLine(color(1) == Some(Color.Green)); // true
+    Console.writeLine(color(1) != Some(Color.Red));   // true
+    Console.writeLine(nested(2) == Some(Some(2i64))); // true
+    Console.writeLine(nested(1) == Some(null));       // true
+    Console.writeLine(nested(0) == nested(1));        // false
+    Console.writeLine(a == null);            // true? no: false
+}

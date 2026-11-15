@@ -1,0 +1,6 @@
+fn f() -> Result<void, u32> => Ok();
+
+fn main() {
+    let r = f().ok();
+    Console.writeLine(r != null);
+}

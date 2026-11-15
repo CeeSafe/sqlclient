@@ -1,0 +1,25 @@
+fn skip(data: Slice<u8>, at: usize) -> usize? => if (at < data.length) Some(at + 1) else null;
+
+fn walk(data: Slice<u8>) -> Result<usize?, u32> {
+    var pos: usize = 0;
+    pos = skip(data, pos) ?? { return Ok(null); };
+    pos = skip(data, pos) ?? {
+        let fallback = pos * 10;
+        fallback + 1
+    };
+    var total: usize = 0;
+    for (b in data) {
+        let n = skip(data, b as usize) ?? { continue; };
+        total += n;
+    }
+    return Ok(Some(pos + total));
+}
+
+fn main() {
+    let empty: Slice<u8> = [];
+    let some = [0u8, 1, 5];
+    Console.writeLine(walk(empty).ok()! == null);
+    Console.writeLine(walk(some[..]).ok()!!);
+    let one = [0u8];
+    Console.writeLine(walk(one[..]).ok()!!);
+}

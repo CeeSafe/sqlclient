@@ -1,0 +1,20 @@
+fn find(v: u32) -> u32? => if (v > 2) Some(v) else null;
+
+fn half(v: u32) -> u32? {
+    find(v)?;
+    find(v)!;
+    return Some(v / 2);
+}
+
+fn main() {
+    let x = find(7);
+    x!;
+    Console.writeLine(half(8)!);
+    Console.writeLine(half(1) == null);
+}
+
+fn nested() -> u32?? => Some(Some(3u32));
+
+fn more() {
+    nested()!!;
+}

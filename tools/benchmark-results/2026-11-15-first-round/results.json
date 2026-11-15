@@ -1,0 +1,190 @@
+{
+  "machine": "Darwin arm64",
+  "rounds": 1,
+  "results": {
+    "connect": {
+      "what": "open (TCP, TLS, login) and close, no pool",
+      "same_result": true,
+      "checks": [
+        "1"
+      ],
+      "clients": {
+        "sqlclient": {
+          "median_ms": 695.278771,
+          "p95_ms": 709.922375,
+          "cpu_ms_per_iteration": 4.166666666666667,
+          "peak_rss_mb": 15.5625,
+          "samples": 10
+        },
+        "Microsoft.Data.SqlClient": {
+          "median_ms": 704.66935,
+          "p95_ms": 760.2551,
+          "cpu_ms_per_iteration": 59.166666666666664,
+          "peak_rss_mb": 89.65625,
+          "samples": 10
+        }
+      }
+    },
+    "select1": {
+      "what": "SELECT 1 on a warm connection",
+      "same_result": true,
+      "checks": [
+        "1"
+      ],
+      "clients": {
+        "sqlclient": {
+          "median_ms": 101.4094585,
+          "p95_ms": 108.90675,
+          "cpu_ms_per_iteration": 0.4444444444444445,
+          "peak_rss_mb": 15.203125,
+          "samples": 40
+        },
+        "Microsoft.Data.SqlClient": {
+          "median_ms": 99.9831,
+          "p95_ms": 111.0283,
+          "cpu_ms_per_iteration": 14.888888888888888,
+          "peak_rss_mb": 93.5625,
+          "samples": 40
+        }
+      }
+    },
+    "param": {
+      "what": "a parameterized single-row lookup by primary key",
+      "same_result": true,
+      "checks": [
+        "61"
+      ],
+      "clients": {
+        "sqlclient": {
+          "median_ms": 105.2372705,
+          "p95_ms": 115.757583,
+          "cpu_ms_per_iteration": 0.6666666666666666,
+          "peak_rss_mb": 15.125,
+          "samples": 40
+        },
+        "Microsoft.Data.SqlClient": {
+          "median_ms": 109.4247,
+          "p95_ms": 121.6738,
+          "cpu_ms_per_iteration": 16.22222222222222,
+          "peak_rss_mb": 98.125,
+          "samples": 40
+        }
+      }
+    },
+    "rows": {
+      "what": "read 100,000 rows of six types, every value",
+      "same_result": true,
+      "checks": [
+        "5107562005"
+      ],
+      "clients": {
+        "sqlclient": {
+          "median_ms": 417.353375,
+          "p95_ms": 451.189959,
+          "cpu_ms_per_iteration": 63.333333333333336,
+          "peak_rss_mb": 16.484375,
+          "samples": 5
+        },
+        "Microsoft.Data.SqlClient": {
+          "median_ms": 427.2315,
+          "p95_ms": 439.4972,
+          "cpu_ms_per_iteration": 226.66666666666666,
+          "peak_rss_mb": 101.53125,
+          "samples": 5
+        }
+      }
+    },
+    "insert": {
+      "what": "500 parameterized INSERTs in a transaction",
+      "same_result": true,
+      "checks": [
+        "500"
+      ],
+      "clients": {
+        "sqlclient": {
+          "median_ms": 52424.438416,
+          "p95_ms": 52497.754333,
+          "cpu_ms_per_iteration": 80.0,
+          "peak_rss_mb": 15.078125,
+          "samples": 3
+        },
+        "Microsoft.Data.SqlClient": {
+          "median_ms": 52559.7029,
+          "p95_ms": 52764.3045,
+          "cpu_ms_per_iteration": 550.0,
+          "peak_rss_mb": 97.03125,
+          "samples": 3
+        }
+      }
+    },
+    "bigvalue": {
+      "what": "a 1 MB nvarchar(max) parameter echoed back",
+      "same_result": true,
+      "checks": [
+        "1048576"
+      ],
+      "clients": {
+        "sqlclient": {
+          "median_ms": 663.300062,
+          "p95_ms": 731.801625,
+          "cpu_ms_per_iteration": 23.333333333333336,
+          "peak_rss_mb": 28.703125,
+          "samples": 10
+        },
+        "Microsoft.Data.SqlClient": {
+          "median_ms": 639.52205,
+          "p95_ms": 2175.9203,
+          "cpu_ms_per_iteration": 151.66666666666666,
+          "peak_rss_mb": 149.53125,
+          "samples": 10
+        }
+      }
+    },
+    "json": {
+      "what": "FOR JSON of 10,000 rows, joined",
+      "same_result": true,
+      "checks": [
+        "610022"
+      ],
+      "clients": {
+        "sqlclient": {
+          "median_ms": 228.314,
+          "p95_ms": 245.519542,
+          "cpu_ms_per_iteration": 8.333333333333334,
+          "peak_rss_mb": 17.8125,
+          "samples": 10
+        },
+        "Microsoft.Data.SqlClient": {
+          "median_ms": 290.1955,
+          "p95_ms": 447.716,
+          "cpu_ms_per_iteration": 82.5,
+          "peak_rss_mb": 104.296875,
+          "samples": 10
+        }
+      }
+    },
+    "pool": {
+      "what": "16 tasks at once x 25 SELECT 1 through a pool of 16",
+      "same_result": true,
+      "checks": [
+        "400"
+      ],
+      "clients": {
+        "sqlclient": {
+          "median_ms": 2939.481458,
+          "p95_ms": 2978.122417,
+          "cpu_ms_per_iteration": 43.333333333333336,
+          "peak_rss_mb": 18.03125,
+          "samples": 5
+        },
+        "Microsoft.Data.SqlClient": {
+          "median_ms": 3077.5255,
+          "p95_ms": 5617.917,
+          "cpu_ms_per_iteration": 423.3333333333333,
+          "peak_rss_mb": 104.234375,
+          "samples": 5
+        }
+      }
+    }
+  }
+}

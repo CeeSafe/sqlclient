@@ -1,0 +1,13 @@
+fn wrap<T>(v: T) -> Result<T, u32> => Ok(v);
+
+fn pass<T>(r: Result<T, u32>) -> Result<T, u32> => match (r) {
+    Ok(v) => Ok(v),
+    Err(e) => Err(e),
+};
+
+fn unit() {}
+
+fn main() {
+    let r = pass(wrap(unit()));
+    Console.writeLine(r.isOk());
+}

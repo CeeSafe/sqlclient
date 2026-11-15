@@ -1,0 +1,28 @@
+struct Config {
+    label: String?;
+
+    fn name(borrow this) -> borrow (String?) => borrow this.label;
+}
+
+fn length(c: borrow Config) -> Result<usize, u32> {
+    let n = c.name() ?? { return Err(7); };
+    return Ok(n.length);
+}
+
+fn bump(slot: borrow mut (u32?)) -> u32 {
+    let v = slot ?? { return 0; };
+    v += 1;
+    return v;
+}
+
+fn main() {
+    let named = Config { label: Some(String.from("abc")!) };
+    let unnamed = Config { label: null };
+    Console.writeLine(length(named)!);
+    Console.writeLine(length(unnamed).isErr());
+    var slot: u32? = Some(41);
+    Console.writeLine(bump(mut slot));
+    Console.writeLine(slot!);
+    var empty: u32? = null;
+    Console.writeLine(bump(mut empty));
+}

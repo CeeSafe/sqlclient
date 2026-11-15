@@ -1,0 +1,31 @@
+{
+  "machine": "Darwin arm64",
+  "rounds": 3,
+  "results": {
+    "batch": {
+      "what": "the same 100 INSERTs as one batch (SqlBatch)",
+      "same_result": true,
+      "checks": [
+        "100"
+      ],
+      "clients": {
+        "sqlclient": {
+          "median_ms": 352.341208,
+          "p95_ms": 359.679916,
+          "cpu_ms_per_iteration": 0.472,
+          "process_cpu_s": 0.01,
+          "peak_rss_mb": 16.4375,
+          "samples": 15
+        },
+        "Microsoft.Data.SqlClient": {
+          "median_ms": 341.2885,
+          "p95_ms": 356.1882,
+          "cpu_ms_per_iteration": 27.3684,
+          "process_cpu_s": 0.36,
+          "peak_rss_mb": 94.375,
+          "samples": 15
+        }
+      }
+    }
+  }
+}

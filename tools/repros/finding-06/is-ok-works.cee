@@ -1,0 +1,7 @@
+fn f() -> Result<void, u32> => Ok();
+
+fn main() {
+    Console.writeLine(f().isOk());
+    let e = f().err();
+    Console.writeLine(e == null);
+}
