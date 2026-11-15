@@ -85,4 +85,6 @@ run code in a sandbox. The specification is embedded in `ceesafec`, so its answe
 - The package needs ceesafec 0.47.1 or later, which fixed every finding in CEESAFE_FINDINGS.md; use what they added
   (`?? { return …; }`, `!= Some(…)` on optionals, `copyWithin`).
 - New CeeSafe gaps or bugs go in CEESAFE_FINDINGS.md.
-- Live tests need `MSSQL_TEST_CONNECTION`; never write credentials into a file.
+- Live tests need `MSSQL_TEST_CONNECTION` (and `MSSQL_TEST_ACCESS_TOKEN` for Azure SQL with Entra ID, from
+  `az account get-access-token --resource https://database.windows.net/`); never write credentials or tokens into
+  a file. Run them against both kinds of server when changing the login or the protocol.

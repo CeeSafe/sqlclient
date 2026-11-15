@@ -1,5 +1,6 @@
 // Runs a SQL batch and prints every result set as tab-separated text, then the server's messages.
-// Usage: query <sql>, with the connection string in MSSQL_CONNECTION:
+// Usage: query <sql>, with the connection string in MSSQL_CONNECTION (and an Entra ID access token in
+// MSSQL_ACCESS_TOKEN, for Azure SQL):
 //   MSSQL_CONNECTION="Server=db,1433;Database=master;User Id=sa;Password=…;TrustServerCertificate=true" \
 //       query "SELECT name, create_date FROM sys.databases"
 import sqlclient.MsSqlConfig;
@@ -45,7 +46,17 @@ async fn printRows(rows: borrow MsSqlRows) -> Result<void, MsSqlError> {
 }
 
 async fn run(config: borrow MsSqlConfig, sql: StringView) -> Result<void, MsSqlError> {
-    var connection = await MsSqlConnection.connect(config)?;
+    var why = String.create();
+    var connection = match (await MsSqlConnection.connectExplained(config, mut why)) {
+        Ok(c) => c,
+        Err(e) => {
+            if (why.length > 0) {
+                await say(why.view()); // the server's reason for refusing the login
+                await say("\n");
+            }
+            return Err(e);
+        }
+    };
     let none = MsSqlParams.create();
     let outcome = await connection.queryAll(sql, none);
     for (m in connection.messages()) {
@@ -88,13 +99,24 @@ fn main() {
             Process.exit(2);
         }
     };
-    let config = match (MsSqlConfig.parse(text)) {
+    var config = match (MsSqlConfig.parse(text)) {
         Ok(c) => c,
         Err(e) => {
             Console.writeErrorLine(MsSqlErrors.describe(e));
             Process.exit(2);
         }
     };
+    // An Entra ID access token (`az account get-access-token --resource https://database.windows.net/`), for Azure
+    // SQL; read from the environment, never from the command line.
+    match (Environment.variable("MSSQL_ACCESS_TOKEN")) {
+        Some(token) => {
+            match (config.setAccessToken(token)) {
+                Ok() => {}
+                Err(_) => { Process.exit(2); }
+            }
+        }
+        null => {}
+    }
     match (Async.run(run(config, sql))) {
         Ok() => {}
         Err(e) => {

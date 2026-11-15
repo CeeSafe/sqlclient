@@ -76,6 +76,22 @@ take a while to resume, `ConnectRetryCount=3;ConnectRetryInterval=10`. A named i
 looked up through SQL Server Browser. A URL works too:
 `sqlserver://app:secret@db.example.org:1433?database=shop`.
 
+### Azure SQL with Microsoft Entra ID
+
+```ceesafe
+var config = MsSqlConfig.parse("Server=tcp:myserver.database.windows.net,1433;Database=shop")?;
+config.setAccessToken(token)?;                     // an access token for https://database.windows.net/
+var why = String.create();
+var db = match (await MsSqlConnection.connectExplained(config, mut why)) {
+    Ok(c) => c,
+    Err(e) => { /* why: the server's reason, e.g. a firewall rule missing */ return Err(e); }
+};
+```
+
+The token is yours to get and renew (it lasts about an hour): `az account get-access-token --resource
+https://database.windows.net/ --query accessToken -o tsv`, MSAL, or a managed identity's endpoint. `examples/query`
+takes it from `MSSQL_ACCESS_TOKEN`.
+
 ### Typed parameters and values
 
 ```ceesafe
@@ -370,8 +386,10 @@ result set as tab-separated text, then the server's messages.
     `db.serverCertificate(mut der)` gives the one a session got, to pin on first use.
   - TLS is OpenSSL 3 through the `tls` package's `TlsEngine`; each TDS packet goes in a TLS record of its own, as
     SQL Server requires.
-- **Logins.** SQL logins, and Windows logins with NTLMv2 (`Integrated Security=true` or `Domain=…`, with a user name
-  and password; checked against MS-NLMP's test vectors). The login asks for ODBC behaviour (ANSI_NULLS,
+- **Logins.** SQL logins, Windows logins with NTLMv2 (`Integrated Security=true` or `Domain=…`, with a user name
+  and password; checked against MS-NLMP's test vectors), and Microsoft Entra ID with an access token
+  (`config.setAccessToken(token)`, as SqlConnection.AccessToken: TDS's federated authentication, the token in
+  LOGIN7's FEDAUTH feature). `connectExplained(config, mut why)` gives the server's reason when it refuses a login. The login asks for ODBC behaviour (ANSI_NULLS,
   QUOTED_IDENTIFIER and the rest on), as SqlClient does.
 - **Queries.**
   - `query` gives the first result set, `queryAll` every result set with output parameters, `execute` the rows
@@ -461,7 +479,9 @@ Bugs and bottlenecks in the C# driver that this port does not carry over:
 
 - The ADO.NET (`DbConnection`) and Entity Framework Core surfaces, and `QueryAsync<T>`'s reflection mapping.
   CeeSafe has no reflection; read cells with the typed getters.
-- Kerberos and Entra ID (Azure AD) logins, Always Encrypted, MARS, `sql_variant`, CLR type and fixed `char`
+- Kerberos, and getting Entra ID tokens: `Authentication=ActiveDirectory…` (password, service principal, managed
+  identity, interactive, device code, default) is `UnsupportedAuthentication`; get the token yourself and call
+  `setAccessToken`. Always Encrypted, MARS, `sql_variant`, CLR type and fixed `char`
   parameters (send `nvarchar` or `varbinary`, which the server converts), the UTF-8 feature extension, and the
   double-byte code pages (932, 936, 949, 950) for `varchar` (they read as U+FFFD past ASCII).
 - MySQL and Oracle: CosmoSQLClient's other drivers are for separate packages.
@@ -473,7 +493,12 @@ ceesafec test                                   # unit tests; the live tests pas
 MSSQL_TEST_CONNECTION='Server=host,1433;Database=sqlclient_test;User Id=sa;Password=…;TrustServerCertificate=true' \
     ceesafec test                               # everything, against a real server
 MSSQL_TEST_BACKUP_PATH=/var/opt/mssql/data/t.bak …  # also the backup test, which writes that file on the server
+MSSQL_TEST_CONNECTION='Server=tcp:myserver.database.windows.net,1433;Database=…' \
+MSSQL_TEST_ACCESS_TOKEN="$(az account get-access-token --resource https://database.windows.net/ --query accessToken -o tsv)" \
+    ceesafec test                               # everything, against Azure SQL with Entra ID
 ```
+
+The live tests pass against SQL Server 2025 with a SQL login and against Azure SQL Database with an Entra ID token.
 
 The unit tests cover MD4, HMAC-MD5 and NTLMv2 (against the RFCs' and MS-NLMP's vectors), UTF-16 and code pages,
 decimals, dates and GUIDs, connection strings, PRELOGIN and LOGIN7, the token decoder (every prefix of a row and of

@@ -312,7 +312,7 @@ fn poolAndAddressKeysParse() -> Result<void, TestFailure> {
 @test
 fn preLoginRoundTrips() -> Result<void, TestFailure> {
     var request = Vector<u8>.create();
-    buildPreLogin(ENCRYPT_ON, "", mut request)!;
+    buildPreLogin(ENCRYPT_ON, "", false, mut request)!;
     let answer = parsePreLogin(request.view())!;
     Check.equalU64(ENCRYPT_ON as u64, answer.encryption as u64)?;
     Check.equalU64(0x10, answer.major as u64)?;
@@ -677,5 +677,44 @@ fn retryKeysParse() -> Result<void, TestFailure> {
     Check.equalText("config", parseOutcome("Server=a;ConnectRetryCount=256"))?;
     Check.equalText("config", parseOutcome("Server=a;ConnectRetryInterval=0"))?;
     Check.equalText("config", parseOutcome("Server=a;ConnectRetryInterval=61"))?;
+    return Ok();
+}
+
+// ── Entra ID access tokens ───────────────────────────────────────────────────────────────────────────────────
+
+@test
+fn federatedLoginsAreLaidOut() -> Result<void, TestFailure> {
+    // PRELOGIN gains FEDAUTHREQUIRED (6), with the value 1, as its sixth option.
+    var request = Vector<u8>.create();
+    buildPreLogin(ENCRYPT_ON, "", true, mut request)!;
+    let b = request.view();
+    Check.equalU64(0x06, b[25] as u64)?;
+    Check.equalU64(0xFF, b[30] as u64)?;
+    Check.equalU64(0x01, b[b.length - 1] as u64)?;
+    // A server that wants the echo, with a nonce; another feature block before.
+    var answer = PreLoginAnswer {
+        encryption: ENCRYPT_ON,
+        major: 12,
+        minor: 0,
+        build: 0,
+        fedAuthRequired: true,
+        nonce: [7u8; 32],
+        hasNonce: true,
+    };
+    let others = [0x01u8, 0, 0, 0, 0, 0xFF];
+    var block = Vector<u8>.create();
+    addFedAuth(others[..], "eyJ0", answer, mut block)!;
+    let f = block.view();
+    Check.equalU64(0x01, f[0] as u64)?;                       // the other feature, kept
+    Check.equalU64(0x02, f[5] as u64)?;                       // FEDAUTH
+    Check.equalU64(1 + 4 + 8 + 32, f.readLE<u32>(6) as u64)?; // options, length, "eyJ0" in UTF-16, nonce
+    Check.equalU64(0x03, f[10] as u64)?;                      // security token library (1) << 1, echo
+    Check.equalU64(8, f.readLE<u32>(11) as u64)?;
+    Check.equalU64('e' as u64, f[15] as u64)?;
+    Check.equalU64(7, f[23] as u64)?;                         // the nonce
+    Check.equalU64(0xFF, f[f.length - 1] as u64)?;
+    var c = MsSqlConfig.parse("Server=x.database.windows.net;Database=d")!;
+    c.setAccessToken("  eyJ0  ")!;
+    Check.equalText("eyJ0", c.accessToken())?;
     return Ok();
 }

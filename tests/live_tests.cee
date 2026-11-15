@@ -1,12 +1,24 @@
 // Tests against a real server: MSSQL_TEST_CONNECTION is an ADO.NET connection string, for example
 //   Server=127.0.0.1,1433;Database=master;User Id=sa;Password=…;TrustServerCertificate=true
+// and, for Azure SQL with Entra ID, MSSQL_TEST_ACCESS_TOKEN an access token for it
+// (`az account get-access-token --resource https://database.windows.net/ --query accessToken -o tsv`).
 // Without it they pass without running, so `ceesafec test` works on a machine with no server. Each scenario is an
 // async fn run with `Async.run(...)`.
+
+/// `text` parsed, with MSSQL_TEST_ACCESS_TOKEN's token when it is set.
+fn parseTest(text: StringView) -> Result<MsSqlConfig, MsSqlError> {
+    var config = MsSqlConfig.parse(text)?;
+    match (Environment.variable("MSSQL_TEST_ACCESS_TOKEN")) {
+        Some(token) => { config.setAccessToken(token)?; }
+        null => {}
+    }
+    return Ok(config);
+}
 
 /// The test server's configuration, or null to skip.
 fn testConfig() -> MsSqlConfig? {
     let text = Environment.variable("MSSQL_TEST_CONNECTION")?;
-    match (MsSqlConfig.parse(text)) {
+    match (parseTest(text)) {
         Ok(c) => { return c; }
         Err(_) => {
             Console.writeErrorLine("MSSQL_TEST_CONNECTION is not a valid connection string");
@@ -170,6 +182,7 @@ async fn optionalEncryption(config: borrow MsSqlConfig) -> Outcome {
     optional.setPort(config.port());
     optional.setEncrypt(MsEncrypt.Optional)!;
     optional.setTrustServerCertificate(config.trustsServerCertificate())!;
+    optional.setAccessToken(config.accessToken())!;
     var db = match (await MsSqlConnection.connect(optional)) {
         Ok(c) => c,
         Err(e) => { return connectFailed(e); }
@@ -820,7 +833,7 @@ fn poolWarmsUpToMinPoolSize() -> Result<void, TestFailure> {
     var full = String.create();
     let _ = full.append(text);
     let _ = full.append(";Min Pool Size=3;Max Pool Size=4;Connection Lifetime=600;IPAddressPreference=IPv4First");
-    let pool = MsSqlPool.fromConfig(MsSqlConfig.parse(full.view())!)!;
+    let pool = MsSqlPool.fromConfig(parseTest(full.view())!)!;
     return report(Async.run(warmed(pool)));
 }
 
@@ -1103,7 +1116,7 @@ async fn retried(text: StringView, retries: StringView) -> Result<u64, MsSqlErro
     let _ = full.append(text);
     let _ = full.append(";Database=sqlclient_no_such_database;ConnectRetryInterval=1;ConnectRetryCount=");
     let _ = full.append(retries);
-    let config = MsSqlConfig.parse(full.view())?;
+    let config = parseTest(full.view())?;
     let started = Clock.monotonicNanos();
     match (await MsSqlConnection.connect(config)) {
         Ok(_) => { return Err(MsSqlError.Protocol); }
@@ -1123,6 +1136,10 @@ fn transientLoginErrorsAreRetried() -> Result<void, TestFailure> {
     let once = Async.run(retried(text, "0"));
     let twice = Async.run(retried(text, "2"));
     Check.isTrue(once.isOk() && twice.isOk(), "both refused as a login")?;
+    // Azure SQL refuses a missing database as 18456, which is not transient, so it is not retried there.
+    if (testConfig()!.host().endsWith(".database.windows.net")) {
+        return Check.isTrue(twice! < once! + 1900, "18456 not retried");
+    }
     Check.isTrue(twice! >= 2000 && twice! >= once! + 1900, "two retries, a second apart")?;
     return Ok();
 }
@@ -1402,7 +1419,7 @@ fn moreParameterTypesAndResultShapes() -> Result<void, TestFailure> {
 
 async fn pinning(text: StringView) -> Outcome {
     // The certificate the server presents, from a connection that trusts it.
-    let trusting = match (MsSqlConfig.parse(text)) {
+    let trusting = match (parseTest(text)) {
         Ok(c) => c,
         Err(e) => { return connectFailed(e); }
     };
@@ -1421,7 +1438,7 @@ async fn pinning(text: StringView) -> Outcome {
     var full = String.create();
     let _ = full.append(text);
     let _ = full.append(";TrustServerCertificate=false");
-    var pinned = match (MsSqlConfig.parse(full.view())) {
+    var pinned = match (parseTest(full.view())) {
         Ok(c) => c,
         Err(e) => { return connectFailed(e); }
     };
@@ -1446,7 +1463,7 @@ async fn pinning(text: StringView) -> Outcome {
     let _ = withPath.append(full.view());
     let _ = withPath.append(";ServerCertificate=");
     let _ = withPath.append(path);
-    match (MsSqlConfig.parse(withPath.view())) {
+    match (parseTest(withPath.view())) {
         Ok(c) => {
             match (await MsSqlConnection.connect(c)) {
                 Ok(_) => {}
@@ -1459,7 +1476,7 @@ async fn pinning(text: StringView) -> Outcome {
     var other = Vector<u8>.create();
     let _ = other.extend(der.view());
     other[other.length - 1] = other[other.length - 1] ^ 0xFF;
-    var wrongPin = match (MsSqlConfig.parse(text)) {
+    var wrongPin = match (parseTest(text)) {
         Ok(c) => c,
         Err(e) => { return connectFailed(e); }
     };
@@ -1561,7 +1578,7 @@ async fn recovered(config: borrow MsSqlConfig, text: StringView) -> Outcome {
     var full = String.create();
     let _ = full.append(text);
     let _ = full.append(";ConnectRetryCount=0");
-    let noRetry = match (MsSqlConfig.parse(full.view())) {
+    let noRetry = match (parseTest(full.view())) {
         Ok(c) => c,
         Err(e) => { return connectFailed(e); }
     };

@@ -216,13 +216,33 @@ public struct MsSqlConnection {
     /// (an Azure SQL database starting, paused or moving: 4060, 40613, …) is tried again up to `ConnectRetryCount`
     /// times, `ConnectRetryInterval` apart, each attempt with the whole connect timeout.
     public async fn connect(config: borrow MsSqlConfig) -> Result<MsSqlConnection, MsSqlError> {
+        var why = String.create();
+        return await MsSqlConnection.connectExplained(config, mut why);
+    }
+
+    /// `connect`, and when the server refuses the login, its message (18456 "Login failed for user …", a firewall
+    /// rule missing, a database it cannot open) put in `why`, which `connect` drops with the connection.
+    ///
+    /// ```ceesafe
+    /// var why = String.create();
+    /// match (await MsSqlConnection.connectExplained(config, mut why)) {
+    ///     Ok(c) => { … }
+    ///     Err(MsSqlError.Login) => { /* why: "Cannot open server … Client with IP address … is not allowed" */ }
+    ///     Err(e) => { … }
+    /// }
+    /// ```
+    public async fn connectExplained(
+        config: borrow MsSqlConfig,
+        why: borrow mut String,
+    ) -> Result<MsSqlConnection, MsSqlError> {
         // With ConnectRetryCount, the login asks for session recovery, and the connection keeps a copy of `config`
         // to log in again with should the server drop it while it is idle.
+        why.clear();
         var features = Vector<u8>.create();
         if (config.connectRetryCount() > 0) {
             MsSessionRecovery.request(mut features)?;
         }
-        var c = await MsSqlConnection.connectWith(config, features.view(), false)?;
+        var c = await MsSqlConnection.connectWith(config, features.view(), false, why)?;
         if (c.recovery.acknowledged) {
             c.recovery.begin(c.databaseName.view(), c.languageName.view(), c.session.collation)?;
             c.recovery.config = Some(config.clone()?);
@@ -230,29 +250,33 @@ public struct MsSqlConnection {
         return Ok(c);
     }
 
-    /// `connect`, with `features` in the login (a reconnect's recovery data when `reconnecting`).
+    /// `connect`, with `features` in the login (a reconnect's recovery data when `reconnecting`); the server's
+    /// message for a refused login goes in `why`.
     async fn connectWith(
         config: borrow MsSqlConfig,
         features: Slice<u8>,
         reconnecting: bool,
+        why: borrow mut String,
     ) -> Result<MsSqlConnection, MsSqlError> {
         var pin = Vector<u8>.create();
         await config.loadPin(mut pin)?;
         var attempt: u8 = 0;
         loop {
-            var transient = false;
+            var failure = MsLoginFailure { transient: false, message: String.create() };
             let ms = config.connectTimeout();
             let plan = MsLoginPlan { pin: pin.view(), features: features, reconnecting: reconnecting };
-            let outcome = if (ms == 0) await MsSqlConnection.open(config, plan, mut transient)
+            let outcome = if (ms == 0) await MsSqlConnection.open(config, plan, mut failure)
                 else await Async.timeout(
                     ms,
                     MsSqlError.TimedOut,
-                    async () => await MsSqlConnection.open(config, plan, mut transient),
+                    async () => await MsSqlConnection.open(config, plan, mut failure),
                 );
             match (outcome) {
                 Ok(c) => { return Ok(c); }
                 Err(e) => {
-                    if (!transient || attempt >= config.connectRetryCount()) {
+                    why.clear();
+                    allocated(why.append(failure.message.view()))?;
+                    if (!failure.transient || attempt >= config.connectRetryCount()) {
                         return Err(e);
                     }
                 }
@@ -265,20 +289,20 @@ public struct MsSqlConnection {
     async fn open(
         config: borrow MsSqlConfig,
         plan: MsLoginPlan,
-        transient: borrow mut bool,
+        failure: borrow mut MsLoginFailure,
     ) -> Result<MsSqlConnection, MsSqlError> {
         var port = config.port();
         if (port == 0) {
             port = await browseInstancePort(config.host(), config.instance())?;
         }
-        var connection = await MsSqlConnection.openAt(config, config.host(), port, plan, transient)?;
+        var connection = await MsSqlConnection.openAt(config, config.host(), port, plan, failure)?;
         if (connection.routeHost.length == 0) {
             return Ok(connection);
         }
         // Routed: log in again where the server says.
         let host = replace(mut connection.routeHost, String.create());
         let routedPort = connection.routePort;
-        var routed = await MsSqlConnection.openAt(config, host.view(), routedPort, plan, transient)?;
+        var routed = await MsSqlConnection.openAt(config, host.view(), routedPort, plan, failure)?;
         routed.routeHost.clear();
         return Ok(routed);
     }
@@ -288,7 +312,7 @@ public struct MsSqlConnection {
         host: StringView,
         port: u16,
         plan: MsLoginPlan,
-        transient: borrow mut bool,
+        failure: borrow mut MsLoginFailure,
     ) -> Result<MsSqlConnection, MsSqlError> {
         let resolved = match (await AsyncDns.resolve(host, port)) {
             Ok(a) => a,
@@ -307,7 +331,11 @@ public struct MsSqlConnection {
             Ok() => { return Ok(connection); }
             Err(e) => {
                 match (connection.lastError()) {
-                    Some(m) => { *transient = isTransient(m.number); }
+                    Some(m) => {
+                        failure.transient = isTransient(m.number);
+                        failure.message.clear();
+                        allocated(failure.message.append(m.message.view()))?;
+                    }
                     null => {}
                 }
                 return Err(e);
@@ -384,23 +412,38 @@ public struct MsSqlConnection {
         let certificateHost = config.certificateHost();
         // 0: no TLS; 1: TLS for the login only; 2: TLS throughout.
         var level: u8 = 2;
+        let federated = config.accessToken().length > 0;
+        var answer = PreLoginAnswer {
+            encryption: ENCRYPT_NOT_SUP,
+            major: 0,
+            minor: 0,
+            build: 0,
+            fedAuthRequired: false,
+            nonce: [0u8; 32],
+            hasNonce: false,
+        };
         match (config.encrypt()) {
             MsEncrypt.Strict => {
                 var engine = tlsEngine(tlsConfig, certificateHost)?;
                 await this.handshakeRaw(mut engine)?;
                 checkPin(borrow engine, pin)?;
                 this.tls = engine;
-                buildPreLoginOrFail(ENCRYPT_ON, config.instance(), mut this.output)?;
+                buildPreLoginOrFail(ENCRYPT_ON, config.instance(), federated, mut this.output)?;
                 await this.sendMessage(PKT_PRELOGIN)?;
                 await this.readWholeMessage()?;
-                parsePreLogin(this.payload.view())?;
+                answer = parsePreLogin(this.payload.view())?;
             }
             _ => {
                 let mandatory = config.encrypt() is MsEncrypt.Mandatory;
-                buildPreLoginOrFail(if (mandatory) ENCRYPT_ON else ENCRYPT_OFF, config.instance(), mut this.output)?;
+                buildPreLoginOrFail(
+                    if (mandatory) ENCRYPT_ON else ENCRYPT_OFF,
+                    config.instance(),
+                    federated,
+                    mut this.output,
+                )?;
                 await this.sendMessage(PKT_PRELOGIN)?;
                 await this.readWholeMessage()?;
-                let answer = parsePreLogin(this.payload.view())?;
+                answer = parsePreLogin(this.payload.view())?;
                 let server = answer.encryption;
                 if (server == ENCRYPT_NOT_SUP) {
                     if (mandatory) {
@@ -418,8 +461,18 @@ public struct MsSqlConnection {
                 }
             }
         }
-        // LOGIN7.
-        let windows = config.usesWindowsLogin();
+        // LOGIN7. An Entra ID access token goes in the FEDAUTH feature, with no user name or password; it needs the
+        // whole session encrypted, as the server requires for it.
+        var features = Vector<u8>.create();
+        if (federated) {
+            if (level != 2) {
+                return Err(MsSqlError.EncryptionRefused);
+            }
+            addFedAuth(plan.features, config.accessToken(), answer, mut features)?;
+        } else {
+            allocated(features.extend(plan.features))?;
+        }
+        let windows = config.usesWindowsLogin() && !federated;
         var negotiate = Vector<u8>.create();
         if (windows) {
             if (config.user().length == 0 || config.password().length == 0) {
@@ -435,8 +488,8 @@ public struct MsSqlConnection {
         }
         let fields = LoginFields {
             hostName: config.workstation(),
-            userName: if (windows) "" else config.user(),
-            password: if (windows) "" else config.password(),
+            userName: if (windows || federated) "" else config.user(),
+            password: if (windows || federated) "" else config.password(),
             appName: config.applicationName(),
             serverName: serverName.view(),
             language: config.language(),
@@ -444,7 +497,7 @@ public struct MsSqlConnection {
             sspi: negotiate.view(),
             packetSize: config.packetSize(),
             readOnlyIntent: config.readOnlyIntent(),
-            features: plan.features,
+            features: features.view(),
         };
         buildLogin7(fields, mut this.output)?;
         await this.sendMessage(PKT_LOGIN7)?;
@@ -2152,7 +2205,8 @@ public struct MsSqlConnection {
         var failure = MsSqlError.Closed;
         var attempt: u32 = 0;
         while (attempt < tries) {
-            match (await MsSqlConnection.connectWith(borrow config, request.view(), true)) {
+            var why = String.create();
+            match (await MsSqlConnection.connectWith(borrow config, request.view(), true, mut why)) {
                 Ok(fresh) => {
                     var c = fresh;
                     // The new session goes on where the old one was: the request, its settings, its state.
@@ -2322,8 +2376,12 @@ fn tlsEngine(config: borrow TlsConfig, host: StringView) -> Result<TlsEngine, Ms
     }
 }
 
-fn buildPreLoginOrFail(encryption: u8, instance: StringView, out: borrow mut Vector<u8>) -> Result<void, MsSqlError> =>
-    allocated(buildPreLogin(encryption, instance, out));
+fn buildPreLoginOrFail(
+    encryption: u8,
+    instance: StringView,
+    federated: bool,
+    out: borrow mut Vector<u8>,
+) -> Result<void, MsSqlError> => allocated(buildPreLogin(encryption, instance, federated, out));
 
 fn tlsResult<T>(outcome: Result<T, TlsError>) -> Result<T, MsSqlError> {
     match (outcome) {
@@ -2462,4 +2520,11 @@ struct MsLoginPlan<region r> {
     pin: Slice<r, u8>;
     features: Slice<r, u8>;
     reconnecting: bool;
+}
+
+/// Why a login failed: whether the server's error passes, and its message.
+@noncopy
+struct MsLoginFailure {
+    transient: bool;
+    message: String;
 }

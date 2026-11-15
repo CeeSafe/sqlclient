@@ -65,6 +65,8 @@ public struct MsSqlConfig {
     private pinPath: String;
     /// The pinned certificate as DER, when given as bytes.
     private pinDer: Vector<u8>;
+    /// An Entra ID access token to log in with (`setAccessToken`).
+    private token: String;
     private tlsConfig: TlsConfig?;
 
     fn empty() -> MsSqlConfig => MsSqlConfig {
@@ -95,6 +97,7 @@ public struct MsSqlConfig {
         retryMillis: 10000,
         pinPath: String.create(),
         pinDer: Vector<u8>.create(),
+        token: String.create(),
         tlsConfig: null,
     };
 
@@ -129,6 +132,7 @@ public struct MsSqlConfig {
         c.retryMillis = this.retryMillis;
         replaceText(mut c.pinPath, this.pinPath.view())?;
         allocated(c.pinDer.extend(this.pinDer.view()))?;
+        replaceText(mut c.token, this.token.view())?;
         c.tlsConfig = match (borrow this.tlsConfig) {
             Some(t) => Some(t.clone()),
             null => null,
@@ -631,6 +635,17 @@ public struct MsSqlConfig {
         this.pinPath.clear();
         return this.finish();
     }
+
+    /// Logs in to Azure SQL (or SQL Server with Entra ID) with `token`, a Microsoft Entra ID access token for the
+    /// resource `https://database.windows.net/`, as SqlConnection.AccessToken does: no user name or password goes
+    /// to the server, and the whole session is encrypted. The token is the caller's to get (`az account
+    /// get-access-token --resource https://database.windows.net/`, MSAL, a managed identity) and to renew before it
+    /// expires, about an hour on; set a fresh one for later connections. An empty token turns it off.
+    public fn setAccessToken(borrow mut this, token: StringView) -> Result<void, MsSqlError> =>
+        replaceText(mut this.token, token.trim());
+
+    /// The access token `setAccessToken` gave, or empty.
+    public fn accessToken(borrow this) -> StringView => this.token.view();
 
     /// Whether a certificate is pinned (`ServerCertificate` or `setServerCertificate`).
     public fn pinned(borrow this) -> bool => this.pinDer.length > 0 || this.pinPath.length > 0;
