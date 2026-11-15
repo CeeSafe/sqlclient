@@ -521,7 +521,7 @@ The live tests (checked against SQL Server 2025) cover:
 
 ## Benchmarks
 
-[`benchmarks/`](benchmarks/README.md) runs the same eight scenarios with sqlclient and with Microsoft.Data.SqlClient
+[`benchmarks/`](benchmarks/README.md) runs the same ten scenarios with sqlclient and with Microsoft.Data.SqlClient
 6.1.1 on .NET 10. Against a server 98 ms away, both took the same wall time (each spends it waiting on the
 network). sqlclient used 2x to 63x less CPU per operation and about a sixth of the memory:
 
