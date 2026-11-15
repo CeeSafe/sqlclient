@@ -30,6 +30,7 @@ SCENARIOS = {
     "rows": (1, 5, "read 100,000 rows of six types, every value"),
     "insert": (1, 3, "100 parameterized INSERTs in a transaction"),
     "batch": (1, 5, "the same 100 INSERTs as one batch (SqlBatch)"),
+    "stream": (1, 5, "a 16 MB varbinary(max) read in 64 KB pieces (GetStream)"),
     "bigvalue": (2, 10, "a 1 MB nvarchar(max) parameter echoed back"),
     "json": (2, 10, "FOR JSON of 10,000 rows, joined"),
     "pool": (1, 5, "16 tasks at once x 25 SELECT 1 through a pool of 16"),

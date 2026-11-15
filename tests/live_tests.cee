@@ -1215,6 +1215,109 @@ fn batchesRunInOneRequest() -> Result<void, TestFailure> {
     return report(Async.run(batched(config)));
 }
 
+async fn streamedValues(config: borrow MsSqlConfig) -> Outcome {
+    var db = match (await MsSqlConnection.connect(config)) {
+        Ok(c) => c,
+        Err(e) => { return connectFailed(e); }
+    };
+    let none = MsSqlParams.create();
+    // Three rows: a 3 MB text of emoji and accents with a column after it, a NULL, and 1 MB of bytes.
+    let sql = """
+        SELECT 1 AS id, REPLICATE(CAST(N'a😀é' AS nvarchar(max)), 750000) AS body, N'after' AS tail
+        UNION ALL SELECT 2, NULL, N'second'
+        UNION ALL SELECT 3, CAST(REPLICATE(CAST('xyz' AS varchar(max)), 349526) AS nvarchar(max)), N'third'
+        ORDER BY id
+        """;
+    match (await db.start(sql, none)) {
+        Ok(_) => {}
+        Err(e) => { return failed(e, db); }
+    }
+    var head = MsSqlRows.create();
+    // Row 1: the text read piece by piece, then the column after it.
+    match (await db.nextRow(mut head)) {
+        Ok(true) => {}
+        Ok(false) => { return wrong("a first row"); }
+        Err(e) => { return failed(e, db); }
+    }
+    if (head.int64(0, 0) != Some(1i64) || !head.isNull(0, 1) || !head.isNull(0, 2)) {
+        return wrong("the head before the streamed value");
+    }
+    var text = String.create();
+    var pieces: u32 = 0;
+    loop {
+        match (await db.readText(mut text)) {
+            Ok(true) => { pieces += 1; }
+            Ok(false) => { break; }
+            Err(e) => { return failed(e, db); }
+        }
+    }
+    // 'a', an emoji (4 UTF-8 bytes) and 'é' (2): 7 bytes, 750,000 times.
+    if (text.length != 5250000 || pieces < 10 || !text.view().startsWith("a😀éa😀é") || text.view().contains("\u{FFFD}")) {
+        return wrong("the text whole across its pieces");
+    }
+    match (await db.restOfRow(mut head)) {
+        Ok() => {}
+        Err(e) => { return failed(e, db); }
+    }
+    if (head.text(0, 2) != Some("after")) {
+        return wrong("the column after the streamed one");
+    }
+    // Row 2: a NULL value, read whole at once.
+    match (await db.nextRow(mut head)) {
+        Ok(true) => {}
+        _ => { return wrong("a second row"); }
+    }
+    var buffer = [0u8; 1000];
+    match (await db.readChunk(mut buffer[..])) {
+        Ok(0) => {}
+        _ => { return wrong("nothing to stream for a NULL"); }
+    }
+    if (head.int64(0, 0) != Some(2i64) || !head.isNull(0, 1) || head.text(0, 2) != Some("second")) {
+        return wrong("a NULL value's row");
+    }
+    // Row 3: a few bytes read, the rest skipped by the next call.
+    match (await db.nextRow(mut head)) {
+        Ok(true) => {}
+        _ => { return wrong("a third row"); }
+    }
+    match (await db.readChunk(mut buffer[..])) {
+        Ok(n) => {
+            if (n == 0 || buffer[0] != 'x' || buffer[1] != 0) {
+                return wrong("UTF-16 bytes as sent");
+            }
+        }
+        Err(e) => { return failed(e, db); }
+    }
+    match (await db.nextRow(mut head)) {
+        Ok(false) => {}
+        Ok(true) => { return wrong("three rows only"); }
+        Err(e) => { return failed(e, db); }
+    }
+    match (await db.finish()) {
+        Ok(_) => {}
+        Err(e) => { return failed(e, db); }
+    }
+    // And the connection goes on.
+    match (await db.query("SELECT 7", none)) {
+        Ok(r) => {
+            if (r.int64(0, 0) != Some(7i64)) {
+                return wrong("a query after the stream");
+            }
+        }
+        Err(e) => { return failed(e, db); }
+    }
+    return passed();
+}
+
+@test
+fn largeValuesStream() -> Result<void, TestFailure> {
+    let config = match (testConfig()) {
+        Some(c) => c,
+        null => { return Ok(); }
+    };
+    return report(Async.run(streamedValues(config)));
+}
+
 async fn json(config: borrow MsSqlConfig) -> Outcome {
     var db = match (await MsSqlConnection.connect(config)) {
         Ok(c) => c,

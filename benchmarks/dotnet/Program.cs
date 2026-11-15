@@ -134,6 +134,23 @@ async Task<ulong> Once(string name, ulong i)
             await tx.RollbackAsync();
             return (ulong)affected;
         }
+        case "stream":
+        {
+            await using var cmd = new SqlCommand("SELECT CAST(REPLICATE(CAST('0123456789abcdef' AS varchar(max)), 1048576) AS varbinary(max))", db);
+            await using var reader = await cmd.ExecuteReaderAsync(CommandBehavior.SequentialAccess);
+            var buffer = new byte[65536];
+            ulong total = 0;
+            while (await reader.ReadAsync())
+            {
+                await using var stream = reader.GetStream(0);
+                int n;
+                while ((n = await stream.ReadAsync(buffer)) > 0)
+                {
+                    total += (ulong)n;
+                }
+            }
+            return total;
+        }
         case "bigvalue":
         {
             await using var cmd = new SqlCommand("SELECT @p1", db);

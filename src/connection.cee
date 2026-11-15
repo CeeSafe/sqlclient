@@ -174,6 +174,17 @@ public struct MsSqlConnection {
     private errorList: Vector<MsSqlMessage>;
     private infoList: Vector<MsSqlMessage>;
     private status: i32?;
+    /// Streaming one value of a row (`nextRow`): 0 none, 1 reading the value, 2 the value read and the rest of the
+    /// row not yet.
+    private seqPhase: u8;
+    /// The streamed column.
+    private seqColumn: usize;
+    /// What is left of the current PLP chunk.
+    private seqChunkLeft: usize;
+    /// The row's NBCROW null bitmap, or empty.
+    private seqBitmap: Vector<u8>;
+    /// Bytes of a character split between chunks, for `readText`.
+    private seqPending: Vector<u8>;
     private outputs: MsSqlRows;
     /// A small token's body, copied out of the payload to be handled.
     private tokenBody: Vector<u8>;
@@ -300,6 +311,11 @@ public struct MsSqlConnection {
             errorList: Vector<MsSqlMessage>.create(),
             infoList: Vector<MsSqlMessage>.create(),
             status: null,
+            seqPhase: 0,
+            seqColumn: 0,
+            seqChunkLeft: 0,
+            seqBitmap: Vector<u8>.create(),
+            seqPending: Vector<u8>.create(),
             outputs: MsSqlRows.create(),
             tokenBody: Vector<u8>.create(),
             loginAcked: false,
@@ -647,6 +663,7 @@ public struct MsSqlConnection {
         this.status = null;
         this.outputs.clear();
         this.meta.clear();
+        this.seqPhase = 0;
     }
 
     /// Reads tokens until one the caller must see: a result's columns (now in `meta`), a row (stored in `rows`),
@@ -1095,6 +1112,10 @@ public struct MsSqlConnection {
             }
             this.streamCount = 0;
             return if (await this.advanceToResult()?) Ok(1u64) else Ok(0u64);
+        }
+        if (this.seqPhase != 0) {
+            var skipped = MsSqlRows.create();
+            await this.restOfRowNow(mut skipped)?;
         }
         if (op == OP_FETCH) {
             return if (await this.fetchRows(rows, max)?) Ok(1u64) else Ok(0u64);
@@ -1555,6 +1576,7 @@ public struct MsSqlConnection {
         if (this.stream == S_IDLE) {
             return Ok();
         }
+        this.seqPhase = 0;
         match (await this.recoverWithin()) {
             Ok() => { return Ok(); }
             Err(e) => {
@@ -1563,6 +1585,343 @@ public struct MsSqlConnection {
                 return Err(e);
             }
         }
+    }
+
+    // ---- Streaming a large value ----
+
+    /// Reads the next row of a streamed result (`start`) up to its first `(max)` value, which it leaves unread for
+    /// `readChunk` or `readText` to take piece by piece: a value of gigabytes then needs no more memory than a
+    /// packet. `head` gets the row, with that column and the ones after it NULL until `restOfRow` reads the ones
+    /// after it. A row without a `(max)` column is read whole. False at the end of the result set, as for `fetch`.
+    ///
+    /// ```ceesafe
+    /// await db.start("SELECT id, name, content FROM dbo.files", none)?;
+    /// var head = MsSqlRows.create();
+    /// var buffer = [0u8; 65536];
+    /// while (await db.nextRow(mut head)?) {
+    ///     let id = head.int64(0, 0);
+    ///     loop {
+    ///         let n = await db.readChunk(mut buffer[..])?;  // the bytes of `content`, as sent
+    ///         if (n == 0) {
+    ///             break;
+    ///         }
+    ///         // write buffer[0..n] somewhere
+    ///     }
+    /// }
+    /// await db.finish()?;
+    /// ```
+    ///
+    /// Reading the next row, `fetch`, `nextResult` or `finish` skips what is left of the value and of the row.
+    public async fn nextRow(borrow mut this, head: borrow mut MsSqlRows) -> Result<bool, MsSqlError> {
+        let ms = this.commandMillis;
+        let outcome = if (ms == 0) await this.nextRowNow(head)
+            else await Async.timeout(ms, MsSqlError.TimedOut, async () => await this.nextRowNow(head));
+        match (outcome) {
+            Ok(v) => { return Ok(v); }
+            Err(e) => { return Err(await this.settle(e)); }
+        }
+    }
+
+    /// Up to `buffer.length` more bytes of the value `nextRow` left unread, as the server sends them: UTF-16 for
+    /// `nvarchar(max)`, the code page's bytes for `varchar(max)`, the bytes of `varbinary(max)`. 0 at its end (and
+    /// when no value is being streamed).
+    public async fn readChunk(borrow mut this, buffer: SliceMut<u8>) -> Result<usize, MsSqlError> {
+        if (buffer.length == 0) {
+            return Err(MsSqlError.Config);
+        }
+        let ms = this.commandMillis;
+        let outcome = if (ms == 0) await this.readChunkNow(buffer)
+            else await Async.timeout(ms, MsSqlError.TimedOut, async () => await this.readChunkNow(buffer));
+        match (outcome) {
+            Ok(v) => { return Ok(v); }
+            Err(e) => { return Err(await this.settle(e)); }
+        }
+    }
+
+    /// Appends the next piece of the text value `nextRow` left unread to `out`, as UTF-8; false at its end. A
+    /// character split between pieces is kept whole for the next one. `WrongState` for a binary value.
+    public async fn readText(borrow mut this, out: borrow mut String) -> Result<bool, MsSqlError> {
+        let ms = this.commandMillis;
+        let outcome = if (ms == 0) await this.readTextNow(out)
+            else await Async.timeout(ms, MsSqlError.TimedOut, async () => await this.readTextNow(out));
+        match (outcome) {
+            Ok(v) => { return Ok(v); }
+            Err(e) => { return Err(await this.settle(e)); }
+        }
+    }
+
+    /// Reads the columns after the streamed one into `head` (skipping what is left of the value).
+    public async fn restOfRow(borrow mut this, head: borrow mut MsSqlRows) -> Result<void, MsSqlError> {
+        let ms = this.commandMillis;
+        let outcome = if (ms == 0) await this.restOfRowNow(head)
+            else await Async.timeout(ms, MsSqlError.TimedOut, async () => await this.restOfRowNow(head));
+        match (outcome) {
+            Ok() => { return Ok(); }
+            Err(e) => { return Err(await this.settle(e)); }
+        }
+    }
+
+    /// Leaves the connection in a known state after a streaming operation failed with `e`, as `run` does.
+    async fn settle(borrow mut this, e: MsSqlError) -> MsSqlError {
+        this.seqPhase = 0;
+        match (e) {
+            MsSqlError.Server => {}
+            MsSqlError.TimedOut => {
+                match (await this.recoverWithin()) {
+                    Ok() => {}
+                    Err(_) => {
+                        this.busy = true;
+                        this.stream = S_IDLE;
+                    }
+                }
+            }
+            _ => {
+                this.busy = true;
+                this.stream = S_IDLE;
+            }
+        }
+        return e;
+    }
+
+    /// Reads packets until `count` bytes are there from `payStart`.
+    async fn waitBytes(borrow mut this, count: usize) -> Result<void, MsSqlError> {
+        while (this.payload.length - this.payStart < count) {
+            if (this.messageDone) {
+                return Err(MsSqlError.Protocol);
+            }
+            await this.readPacket()?;
+        }
+        return Ok();
+    }
+
+    async fn nextRowNow(borrow mut this, head: borrow mut MsSqlRows) -> Result<bool, MsSqlError> {
+        if (this.busy && this.stream == S_IDLE) {
+            return Err(MsSqlError.Broken);
+        }
+        if (this.stream != S_ROWS) {
+            return Ok(false);
+        }
+        var scratch = MsSqlRows.create();
+        if (this.seqPhase != 0) {
+            await this.restOfRowNow(mut scratch)?;
+        }
+        head.clear();
+        head.describe(borrow this.meta)?;
+        loop {
+            if (this.ended) {
+                this.endStream()?;
+                return Ok(false);
+            }
+            if (this.payload.length == this.payStart) {
+                await this.waitBytes(1)?;
+            }
+            let token = this.payload[this.payStart];
+            if (token == 0xD1 || token == 0xD2) {
+                return await this.beginRow(head, token == 0xD2);
+            }
+            // Anything else, as `step` reads it.
+            let r = this.parseToken(mut scratch)?;
+            if (r == 0) {
+                continue;
+            }
+            if (r == NEED) {
+                await this.waitBytes(this.needBytes)?;
+                continue;
+            }
+            if (r == EV_DONE && this.ended) {
+                while (!this.messageDone) {
+                    await this.readPacket()?;
+                }
+            }
+            if (r == EV_COLUMNS) {
+                this.stream = S_NEXT;
+                return Ok(false);
+            }
+            if (r == EV_DONE) {
+                this.countDone();
+                this.stream = S_BETWEEN;
+                return Ok(false);
+            }
+            if (r == EV_END) {
+                this.endStream()?;
+                return Ok(false);
+            }
+        }
+    }
+
+    /// The row at `payStart` up to its first PLP value. Offsets are kept from `payStart`, which a packet read may
+    /// move (it compacts the payload), and `payStart` moves only once a part is whole.
+    async fn beginRow(borrow mut this, head: borrow mut MsSqlRows, nullBitmap: bool) -> Result<bool, MsSqlError> {
+        let n = this.meta.columns.length;
+        var k = n;
+        for (i in 0..n) {
+            if (this.meta.columns[i].layout == L_PLP) {
+                k = i;
+                break;
+            }
+        }
+        let bitmapLength = if (nullBitmap) (n + 7) / 8 else 0usize;
+        await this.waitBytes(1 + bitmapLength)?;
+        this.seqBitmap.clear();
+        allocated(this.seqBitmap.extend(this.payload[this.payStart + 1..this.payStart + 1 + bitmapLength]))?;
+        this.payStart += 1 + bitmapLength;
+        await this.readColumnsInto(head, 0, k)?;
+        if (k == n) {
+            head.endRow();
+            return Ok(true);
+        }
+        let isNull = this.seqBitmap.length > 0 && (this.seqBitmap[k / 8] & (1u8 << truncate<u8>(k % 8))) != 0;
+        var total: u64 = 0xFFFFFFFFFFFFFFFF;
+        if (!isNull) {
+            await this.waitBytes(8)?;
+            total = this.payload.view().readLE<u64>(this.payStart);
+            this.payStart += 8;
+        }
+        head.pushNull()?;
+        if (total == 0xFFFFFFFFFFFFFFFF) {
+            // A NULL value: nothing to stream, the rest of the row is read now.
+            await this.readColumnsInto(head, k + 1, n)?;
+            head.endRow();
+            return Ok(true);
+        }
+        for (i in k + 1..n) {
+            head.pushNull()?;
+        }
+        head.endRow();
+        this.seqPhase = 1;
+        this.seqColumn = k;
+        this.seqChunkLeft = 0;
+        this.seqPending.clear();
+        return Ok(true);
+    }
+
+    /// Columns `from` to `to` of the row at `payStart` into `rows`, waiting for packets as needed.
+    async fn readColumnsInto(
+        borrow mut this,
+        rows: borrow mut MsSqlRows,
+        from: usize,
+        to: usize,
+    ) -> Result<void, MsSqlError> {
+        loop {
+            var need: usize = 0;
+            match (rows.readColumns(
+                this.payload.view(),
+                this.payStart,
+                borrow this.meta,
+                from,
+                to,
+                this.seqBitmap.view(),
+                mut need,
+            )?) {
+                Some(end) => {
+                    this.payStart = end;
+                    return Ok();
+                }
+                null => { await this.waitBytes(if (need == 0) this.payload.length - this.payStart + 1 else need)?; }
+            }
+        }
+    }
+
+    async fn readChunkNow(borrow mut this, buffer: SliceMut<u8>) -> Result<usize, MsSqlError> {
+        if (this.seqPhase != 1) {
+            return Ok(0);
+        }
+        if (this.seqChunkLeft == 0) {
+            await this.waitBytes(4)?;
+            let chunk = this.payload.view().readLE<u32>(this.payStart) as usize;
+            this.payStart += 4;
+            if (chunk == 0) {
+                this.seqPhase = 2;
+                return Ok(0);
+            }
+            this.seqChunkLeft = chunk;
+        }
+        await this.waitBytes(1)?;
+        var n = this.payload.length - this.payStart;
+        if (n > this.seqChunkLeft) {
+            n = this.seqChunkLeft;
+        }
+        if (n > buffer.length) {
+            n = buffer.length;
+        }
+        buffer[0..n].copyFrom(this.payload[this.payStart..this.payStart + n]);
+        this.payStart += n;
+        this.seqChunkLeft -= n;
+        return Ok(n);
+    }
+
+    async fn readTextNow(borrow mut this, out: borrow mut String) -> Result<bool, MsSqlError> {
+        if (this.seqPhase != 1) {
+            return Ok(false);
+        }
+        let column = this.meta.columns[this.seqColumn];
+        if (column.encoding == ENC_NONE) {
+            return Err(MsSqlError.WrongState);
+        }
+        var piece = [0u8; 8192];
+        loop {
+            let n = await this.readChunkNow(mut piece[..])?;
+            if (n == 0) {
+                // The end: a character cut short is a replacement character.
+                if (this.seqPending.length > 0) {
+                    allocated(out.append("\u{FFFD}"))?;
+                    this.seqPending.clear();
+                }
+                return Ok(false);
+            }
+            allocated(this.seqPending.extend(piece[0..n]))?;
+            let pending = this.seqPending.view();
+            var cut = pending.length;
+            if (column.encoding == ENC_UTF16) {
+                cut = cut - cut % 2;
+                if (cut >= 2) {
+                    let unit = pending.readLE<u16>(cut - 2);
+                    if (unit >= 0xD800 && unit <= 0xDBFF) {
+                        cut -= 2; // a high surrogate waits for its pair
+                    }
+                }
+            } else if (column.codePage == 65001) {
+                cut = utf8Boundary(pending);
+            }
+            if (cut == 0) {
+                continue;
+            }
+            if (column.encoding == ENC_UTF16) {
+                allocated(Utf16.decodeInto(pending[0..cut], out))?;
+            } else {
+                var decoded = Vector<u8>.create();
+                allocated(CodePages.decode(column.codePage, pending[0..cut], mut decoded))?;
+                allocated(out.append(StringView.fromUtf8(decoded.view()) ?? ""))?;
+            }
+            let rest = this.seqPending.length - cut;
+            this.seqPending.copyWithin(cut, 0, rest);
+            this.seqPending.truncate(rest);
+            return Ok(true);
+        }
+    }
+
+    async fn restOfRowNow(borrow mut this, rows: borrow mut MsSqlRows) -> Result<void, MsSqlError> {
+        if (this.seqPhase == 0) {
+            return Ok();
+        }
+        var sink = [0u8; 8192];
+        while (this.seqPhase == 1) {
+            let _ = await this.readChunkNow(mut sink[..])?;
+        }
+        let n = this.meta.columns.length;
+        let k = this.seqColumn;
+        if (rows.columnCount() == n && rows.rowCount() == 1) {
+            rows.cutCells(k + 1);
+        } else {
+            rows.clear();
+            rows.describe(borrow this.meta)?;
+            for (i in 0..k + 1) {
+                rows.pushNull()?;
+            }
+        }
+        await this.readColumnsInto(rows, k + 1, n)?;
+        this.seqPhase = 0;
+        return Ok();
     }
 
     // ---- Backups ----
@@ -1894,4 +2253,21 @@ async fn connectAny(addresses: Slice<SocketAddress>) -> Result<AsyncTcpStream, M
             null => { return Err(failure); }
         }
     }
+}
+
+/// The length of `bytes`' longest prefix that does not end inside a UTF-8 sequence.
+fn utf8Boundary(bytes: Slice<u8>) -> usize {
+    let n = bytes.length;
+    var back: usize = 1;
+    while (back <= 3 && back <= n) {
+        let b = bytes[n - back];
+        if ((b & 0xC0) != 0x80) {
+            // A lead byte (or ASCII): whole if its sequence fits in what follows it.
+            let size: usize =
+                if (b < 0x80) 1usize else (if (b >= 0xF0) 4usize else (if (b >= 0xE0) 3usize else 2usize));
+            return if (size <= back) n else n - back;
+        }
+        back += 1;
+    }
+    return n;
 }

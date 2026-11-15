@@ -133,6 +133,29 @@ let _ = await db.fetch(mut batch, 10)?;
 await db.cancel()?;
 ```
 
+### Streaming one large value
+
+```ceesafe
+await db.start("SELECT id, content, name FROM dbo.files", none)?;
+var head = MsSqlRows.create();
+var buffer = [0u8; 65536];
+while (await db.nextRow(mut head)?) {              // the row up to its first (max) column
+    let id = head.int64(0, 0);
+    loop {
+        let n = await db.readChunk(mut buffer[..])?;   // content, a packet at a time; readText(mut s) gives UTF-8
+        if (n == 0) {
+            break;
+        }
+        // write buffer[0..n] to a file
+    }
+    await db.restOfRow(mut head)?;                 // the columns after it: name
+}
+await db.finish()?;
+```
+
+A value of gigabytes needs no more memory than a packet: a 16 MB `varbinary(max)` streams with the process at
+16 MB, as with `SELECT 1`. Skipping `readChunk` or `restOfRow` is fine; the next call passes over what is left.
+
 ### Transactions and server errors
 
 ```ceesafe
@@ -354,6 +377,9 @@ result set as tab-separated text, then the server's messages.
     included.
 - **Streaming.** For results too large to hold:
   - `start(sql, params)`, then `fetch(mut rows, n)` up to n rows at a time, `nextResult()`, and `finish()`.
+  - `nextRow(mut head)` reads a row up to its first `(max)` value, which `readChunk(buffer)` (bytes as sent) or
+    `readText(mut s)` (UTF-8, characters kept whole across pieces) then give piece by piece, as `SequentialAccess`
+    with `GetStream` or `GetTextReader` does; `restOfRow(mut head)` reads the columns after it.
   - `cancel()` stops early, by an attention; the connection stays usable.
   - Reading is incremental, packet by packet: a value split across packets is resumed, not re-read from the start.
 - **Errors.**
@@ -437,7 +463,8 @@ The live tests (checked against SQL Server 2025) cover:
 - a command timeout answered by an attention, the pool's session reset and warm-up, a pooled connection replaced
   after a `KILL`, transient login errors retried, and `FOR JSON`;
 - table-valued parameters and bulk copies of fourteen column types, NULLs, defaults, 20,000 rows, and a refused load;
-- a batch of 102 commands (inserts, two result sets, a procedure's output), and one with a failing command inside.
+- a batch of 102 commands (inserts, two result sets, a procedure's output), and one with a failing command inside;
+- a 6 MB `nvarchar(max)` of emoji streamed as UTF-8 with every character whole, a NULL, a skipped value.
 
 ## Benchmarks
 
@@ -453,6 +480,7 @@ network). sqlclient used 2x to 58x less CPU per operation and about a sixth of t
 | 1 MB `nvarchar(max)` round trip | 20 ms | 100 ms | 29 MB vs 154 MB |
 | 16 tasks × 25 queries through a pool | 22 ms | 196 ms | 18 MB vs 106 MB |
 | 100 INSERTs as one batch (`SqlBatch`) | 0.47 ms | 27.4 ms | 16 MB vs 94 MB |
+| a 16 MB `varbinary(max)` streamed (`GetStream`) | 17 ms | 124 ms | 16 MB vs 102 MB |
 
 
 [`CEESAFE_FINDINGS.md`](CEESAFE_FINDINGS.md) lists the gaps and bugs in CeeSafe met during the port; all are fixed

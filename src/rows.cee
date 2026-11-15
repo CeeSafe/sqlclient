@@ -582,6 +582,56 @@ public struct MsSqlRows {
         return Ok(Some(pos));
     }
 
+    /// Reads columns `from` to `to` (not included) of a row at `at` into new cells, as NULL those `bitmap` (an
+    /// NBCROW's null bitmap, or empty) marks. On null (they run past `data`) nothing is kept, and `need` counts
+    /// from `at`.
+    fn readColumns(
+        borrow mut this,
+        data: Slice<u8>,
+        at: usize,
+        meta: borrow MsMeta,
+        from: usize,
+        to: usize,
+        bitmap: Slice<u8>,
+        need: borrow mut usize,
+    ) -> Result<usize?, MsSqlError> {
+        let keptData = this.data.length;
+        let keptCells = this.cells.length;
+        var pos = at;
+        for (i in from..to) {
+            if (bitmap.length > 0 && (bitmap[i / 8] & (1u8 << truncate<u8>(i % 8))) != 0) {
+                allocated(this.cells.push(MsCell { at: 0, length: 0, typ: T_NULL, scale: 0 }))?;
+                continue;
+            }
+            var valueNeed: usize = 0;
+            match (this.readValue(data, pos, meta.columns[i], mut valueNeed)?) {
+                Some(p) => { pos = p; }
+                null => {
+                    this.data.truncate(keptData);
+                    this.cells.truncate(keptCells);
+                    return incomplete(need, pos - at + valueNeed);
+                }
+            }
+        }
+        return Ok(Some(pos));
+    }
+
+    /// A NULL cell at the end of the row being read.
+    fn pushNull(borrow mut this) -> Result<void, MsSqlError> =>
+        allocated(this.cells.push(MsCell { at: 0, length: 0, typ: T_NULL, scale: 0 }));
+
+    /// Counts the cells read since the last row as a row.
+    fn endRow(borrow mut this) {
+        this.rows += 1;
+    }
+
+    /// Drops the cells after the first `count`.
+    fn cutCells(borrow mut this, count: usize) {
+        this.cells.truncate(count);
+    }
+
+    fn cellCount(borrow this) -> usize => this.cells.length;
+
     /// Reads one value of `column` at `at` into a new cell; null when it runs past `data` (`need` then counts
     /// from `at`).
     fn readValue(

@@ -133,6 +133,27 @@ async fn once(
         await db.rollback()?;
         return Ok(results.affectedRows());
     }
+    if (scenario == "stream") {
+        // A 16 MB value read in pieces, never held whole.
+        await db.start(
+            "SELECT CAST(REPLICATE(CAST('0123456789abcdef' AS varchar(max)), 1048576) AS varbinary(max))",
+            none,
+        )?;
+        var head = MsSqlRows.create();
+        var buffer = [0u8; 65536];
+        var total: u64 = 0;
+        while (await db.nextRow(mut head)?) {
+            loop {
+                let n = await db.readChunk(mut buffer[..])?;
+                if (n == 0) {
+                    break;
+                }
+                total += n as u64;
+            }
+        }
+        await db.finish()?;
+        return Ok(total);
+    }
     if (scenario == "bigvalue") {
         var p = MsSqlParams.create();
         p.text(big)?;
