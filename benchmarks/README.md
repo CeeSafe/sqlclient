@@ -43,24 +43,26 @@ the whole-process CPU and memory are the cost of running it.
 ## Results, 2026-11-15
 
 Apple Silicon Mac (macOS 27), sqlclient built with ceesafec 0.47.1, Microsoft.Data.SqlClient 6.1.1 on .NET 10, SQL
-Server 2025 about 98 ms away (ping), TLS for the login only. Three rounds; medians over every timed iteration.
+Server 2025 about 98 ms away (ping), the whole session encrypted. Three rounds; medians over every timed iteration.
+`results/` holds this run; `../tools/benchmark-results/` the earlier ones.
 
 | Scenario | sqlclient | MDS | sqlclient CPU / iteration | MDS CPU / iteration | MDS ÷ sqlclient CPU | sqlclient peak RSS | MDS peak RSS |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| `connect` | 685 ms | 674 ms | 2.40 ms | 33.94 ms | 14x | 16 MB | 90 MB |
-| `select1` | 101 ms | 102 ms | 0.15 ms | 8.13 ms | 53x | 15 MB | 94 MB |
-| `param` | 109 ms | 102 ms | 0.17 ms | 9.98 ms | 58x | 15 MB | 98 MB |
-| `rows` | 454 ms | 448 ms | 59.87 ms | 118.20 ms | 2x | 17 MB | 103 MB |
-| `insert` | 10716 ms | 10734 ms | 15.28 ms | 77.02 ms | 5x | 15 MB | 92 MB |
-| `batch` | 352 ms | 341 ms | 0.47 ms | 27.37 ms | 58x | 16 MB | 94 MB |
-| `bigvalue` | 612 ms | 630 ms | 20.10 ms | 99.61 ms | 5x | 29 MB | 154 MB |
-| `stream` | 809 ms | 824 ms | 17.28 ms | 123.81 ms | 7x | 16 MB | 102 MB |
-| `json` | 231 ms | 170 ms | 6.60 ms | 36.81 ms | 6x | 18 MB | 106 MB |
-| `pool` | 3062 ms | 3098 ms | 22.34 ms | 195.60 ms | 9x | 18 MB | 106 MB |
+| `connect` | 698 ms | 694 ms | 2.00 ms | 40.48 ms | 20x | 16 MB | 90 MB |
+| `select1` | 107 ms | 105 ms | 0.10 ms | 6.06 ms | 60x | 15 MB | 97 MB |
+| `param` | 104 ms | 110 ms | 0.11 ms | 7.24 ms | 63x | 15 MB | 100 MB |
+| `rows` | 442 ms | 449 ms | 23.90 ms | 52.71 ms | 2x | 17 MB | 105 MB |
+| `insert` | 10999 ms | 11050 ms | 9.02 ms | 42.16 ms | 5x | 15 MB | 101 MB |
+| `batch` | 353 ms | 357 ms | 0.46 ms | 26.36 ms | 58x | 16 MB | 94 MB |
+| `stream` | 792 ms | 790 ms | 13.43 ms | 78.58 ms | 6x | 15 MB | 102 MB |
+| `bigvalue` | 610 ms | 767 ms | 12.34 ms | 64.23 ms | 5x | 28 MB | 147 MB |
+| `json` | 168 ms | 161 ms | 7.41 ms | 45.51 ms | 6x | 18 MB | 109 MB |
+| `pool` | 2966 ms | 3053 ms | 14.92 ms | 122.07 ms | 8x | 19 MB | 105 MB |
 
 Every scenario returned the same checksum from both clients. Wall times are within the network's noise for every
-scenario: with a 98 ms round trip, each client spends nearly all its time waiting. `json` shows this well: run after run,
-either client takes from 170 ms to 450 ms. sqlclient uses 2x (`rows`) to 50x (`select1`, `param`) less CPU per
-operation, and 5–6x less peak memory. MDS's whole-process CPU, start-up and JIT included, is 0.6–2.5 s for each
-scenario's run; sqlclient's is 0.02–0.4 s. Run it against a server on the same machine or network to see throughput
-instead of latency.
+scenario: with a 98 ms round trip, each client spends nearly all its time waiting (`json` and `bigvalue` swing by a
+round trip or two between runs, for either client). `batch` shows what round trips cost: the same 100 INSERTs take
+11 s one by one and 0.35 s as one batch, with either client. sqlclient uses 2x (`rows`) to 63x (`param`) less CPU per
+operation, and about a sixth of the memory; `stream` keeps a 16 MB value at the process's baseline of 15 MB. MDS's
+whole-process CPU, start-up and JIT included, is 0.4 to 1.7 s per scenario's run; sqlclient's is under 0.2 s. Run it
+against a server on the same machine or network to see throughput instead of latency.

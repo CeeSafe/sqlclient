@@ -10,19 +10,19 @@
       ],
       "clients": {
         "sqlclient": {
-          "median_ms": 684.660521,
-          "p95_ms": 716.291292,
-          "cpu_ms_per_iteration": 2.3956,
-          "process_cpu_s": 0.04,
-          "peak_rss_mb": 15.609375,
+          "median_ms": 697.6780415,
+          "p95_ms": 787.673375,
+          "cpu_ms_per_iteration": 2.0029000000000003,
+          "process_cpu_s": 0.03,
+          "peak_rss_mb": 15.765625,
           "samples": 30
         },
         "Microsoft.Data.SqlClient": {
-          "median_ms": 673.50415,
-          "p95_ms": 731.5157,
-          "cpu_ms_per_iteration": 33.9407,
+          "median_ms": 694.02365,
+          "p95_ms": 739.4449,
+          "cpu_ms_per_iteration": 40.477199999999996,
           "process_cpu_s": 0.6699999999999999,
-          "peak_rss_mb": 89.625,
+          "peak_rss_mb": 90.125,
           "samples": 30
         }
       }
@@ -35,19 +35,19 @@
       ],
       "clients": {
         "sqlclient": {
-          "median_ms": 100.509854,
-          "p95_ms": 116.342292,
-          "cpu_ms_per_iteration": 0.1535,
-          "process_cpu_s": 0.02,
-          "peak_rss_mb": 15.21875,
+          "median_ms": 107.3075,
+          "p95_ms": 119.877208,
+          "cpu_ms_per_iteration": 0.101425,
+          "process_cpu_s": 0.0,
+          "peak_rss_mb": 15.40625,
           "samples": 120
         },
         "Microsoft.Data.SqlClient": {
-          "median_ms": 101.9583,
-          "p95_ms": 119.0873,
-          "cpu_ms_per_iteration": 8.12595,
-          "process_cpu_s": 0.6300000000000001,
-          "peak_rss_mb": 93.640625,
+          "median_ms": 104.59205,
+          "p95_ms": 125.7704,
+          "cpu_ms_per_iteration": 6.060875,
+          "process_cpu_s": 0.47,
+          "peak_rss_mb": 97.140625,
           "samples": 120
         }
       }
@@ -60,19 +60,19 @@
       ],
       "clients": {
         "sqlclient": {
-          "median_ms": 109.180625,
-          "p95_ms": 119.831292,
-          "cpu_ms_per_iteration": 0.171,
-          "process_cpu_s": 0.02,
-          "peak_rss_mb": 15.234375,
+          "median_ms": 104.0289165,
+          "p95_ms": 121.1515,
+          "cpu_ms_per_iteration": 0.114325,
+          "process_cpu_s": 0.01,
+          "peak_rss_mb": 15.4375,
           "samples": 120
         },
         "Microsoft.Data.SqlClient": {
-          "median_ms": 101.72865,
-          "p95_ms": 117.3972,
-          "cpu_ms_per_iteration": 9.979949999999999,
-          "process_cpu_s": 0.73,
-          "peak_rss_mb": 98.125,
+          "median_ms": 109.99465,
+          "p95_ms": 122.552,
+          "cpu_ms_per_iteration": 7.238925,
+          "process_cpu_s": 0.54,
+          "peak_rss_mb": 100.28125,
           "samples": 120
         }
       }
@@ -85,19 +85,19 @@
       ],
       "clients": {
         "sqlclient": {
-          "median_ms": 454.399125,
-          "p95_ms": 872.860541,
-          "cpu_ms_per_iteration": 59.872,
-          "process_cpu_s": 0.38,
-          "peak_rss_mb": 16.515625,
+          "median_ms": 441.878625,
+          "p95_ms": 649.952625,
+          "cpu_ms_per_iteration": 23.8962,
+          "process_cpu_s": 0.15,
+          "peak_rss_mb": 16.59375,
           "samples": 15
         },
         "Microsoft.Data.SqlClient": {
-          "median_ms": 447.5213,
-          "p95_ms": 815.8197,
-          "cpu_ms_per_iteration": 118.20020000000001,
-          "process_cpu_s": 1.23,
-          "peak_rss_mb": 103.328125,
+          "median_ms": 449.0595,
+          "p95_ms": 705.1963,
+          "cpu_ms_per_iteration": 52.705799999999996,
+          "process_cpu_s": 0.71,
+          "peak_rss_mb": 104.9375,
           "samples": 15
         }
       }
@@ -110,20 +110,70 @@
       ],
       "clients": {
         "sqlclient": {
-          "median_ms": 10715.787917,
-          "p95_ms": 10817.628792,
-          "cpu_ms_per_iteration": 15.279666666666666,
-          "process_cpu_s": 0.07,
-          "peak_rss_mb": 15.1875,
+          "median_ms": 10998.930209,
+          "p95_ms": 11322.620625,
+          "cpu_ms_per_iteration": 9.021666666666667,
+          "process_cpu_s": 0.04,
+          "peak_rss_mb": 15.4375,
           "samples": 9
         },
         "Microsoft.Data.SqlClient": {
-          "median_ms": 10733.85,
-          "p95_ms": 10868.804,
-          "cpu_ms_per_iteration": 77.02166666666668,
-          "process_cpu_s": 1.22,
-          "peak_rss_mb": 91.578125,
+          "median_ms": 11050.2472,
+          "p95_ms": 11829.1298,
+          "cpu_ms_per_iteration": 42.15833333333333,
+          "process_cpu_s": 0.78,
+          "peak_rss_mb": 101.171875,
           "samples": 9
+        }
+      }
+    },
+    "batch": {
+      "what": "the same 100 INSERTs as one batch (SqlBatch)",
+      "same_result": true,
+      "checks": [
+        "100"
+      ],
+      "clients": {
+        "sqlclient": {
+          "median_ms": 352.657041,
+          "p95_ms": 566.091792,
+          "cpu_ms_per_iteration": 0.45780000000000004,
+          "process_cpu_s": 0.0,
+          "peak_rss_mb": 15.875,
+          "samples": 15
+        },
+        "Microsoft.Data.SqlClient": {
+          "median_ms": 356.8764,
+          "p95_ms": 448.6378,
+          "cpu_ms_per_iteration": 26.361800000000002,
+          "process_cpu_s": 0.36,
+          "peak_rss_mb": 93.75,
+          "samples": 15
+        }
+      }
+    },
+    "stream": {
+      "what": "a 16 MB varbinary(max) read in 64 KB pieces (GetStream)",
+      "same_result": true,
+      "checks": [
+        "16777216"
+      ],
+      "clients": {
+        "sqlclient": {
+          "median_ms": 792.21725,
+          "p95_ms": 879.61,
+          "cpu_ms_per_iteration": 13.433,
+          "process_cpu_s": 0.08,
+          "peak_rss_mb": 15.421875,
+          "samples": 15
+        },
+        "Microsoft.Data.SqlClient": {
+          "median_ms": 789.9836,
+          "p95_ms": 886.664,
+          "cpu_ms_per_iteration": 78.584,
+          "process_cpu_s": 0.95,
+          "peak_rss_mb": 102.15625,
+          "samples": 15
         }
       }
     },
@@ -135,19 +185,19 @@
       ],
       "clients": {
         "sqlclient": {
-          "median_ms": 612.194479,
-          "p95_ms": 650.105541,
-          "cpu_ms_per_iteration": 20.095399999999998,
-          "process_cpu_s": 0.26,
-          "peak_rss_mb": 28.609375,
+          "median_ms": 610.477458,
+          "p95_ms": 872.359667,
+          "cpu_ms_per_iteration": 12.3367,
+          "process_cpu_s": 0.15,
+          "peak_rss_mb": 27.65625,
           "samples": 30
         },
         "Microsoft.Data.SqlClient": {
-          "median_ms": 630.2398,
-          "p95_ms": 712.5813,
-          "cpu_ms_per_iteration": 99.608,
-          "process_cpu_s": 1.98,
-          "peak_rss_mb": 154.125,
+          "median_ms": 767.30865,
+          "p95_ms": 1514.227,
+          "cpu_ms_per_iteration": 64.2325,
+          "process_cpu_s": 1.24,
+          "peak_rss_mb": 147.171875,
           "samples": 30
         }
       }
@@ -160,19 +210,19 @@
       ],
       "clients": {
         "sqlclient": {
-          "median_ms": 230.7008745,
-          "p95_ms": 283.123167,
-          "cpu_ms_per_iteration": 6.5952,
-          "process_cpu_s": 0.1,
-          "peak_rss_mb": 17.859375,
+          "median_ms": 168.05275,
+          "p95_ms": 261.697041,
+          "cpu_ms_per_iteration": 7.410299999999999,
+          "process_cpu_s": 0.09,
+          "peak_rss_mb": 18.296875,
           "samples": 30
         },
         "Microsoft.Data.SqlClient": {
-          "median_ms": 169.908,
-          "p95_ms": 181.5021,
-          "cpu_ms_per_iteration": 36.8058,
-          "process_cpu_s": 0.95,
-          "peak_rss_mb": 105.5625,
+          "median_ms": 161.33645,
+          "p95_ms": 211.3363,
+          "cpu_ms_per_iteration": 45.5109,
+          "process_cpu_s": 0.85,
+          "peak_rss_mb": 108.515625,
           "samples": 30
         }
       }
@@ -185,19 +235,19 @@
       ],
       "clients": {
         "sqlclient": {
-          "median_ms": 3062.193209,
-          "p95_ms": 3768.329708,
-          "cpu_ms_per_iteration": 22.336399999999998,
-          "process_cpu_s": 0.16999999999999998,
-          "peak_rss_mb": 18.03125,
+          "median_ms": 2965.582166,
+          "p95_ms": 3164.876125,
+          "cpu_ms_per_iteration": 14.9176,
+          "process_cpu_s": 0.11,
+          "peak_rss_mb": 18.578125,
           "samples": 15
         },
         "Microsoft.Data.SqlClient": {
-          "median_ms": 3097.6775,
-          "p95_ms": 5880.657,
-          "cpu_ms_per_iteration": 195.6026,
-          "process_cpu_s": 2.4699999999999998,
-          "peak_rss_mb": 105.734375,
+          "median_ms": 3052.7727,
+          "p95_ms": 5621.1846,
+          "cpu_ms_per_iteration": 122.07039999999999,
+          "process_cpu_s": 1.6700000000000002,
+          "peak_rss_mb": 104.921875,
           "samples": 15
         }
       }

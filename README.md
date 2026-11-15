@@ -523,17 +523,18 @@ The live tests (checked against SQL Server 2025) cover:
 
 [`benchmarks/`](benchmarks/README.md) runs the same eight scenarios with sqlclient and with Microsoft.Data.SqlClient
 6.1.1 on .NET 10. Against a server 98 ms away, both took the same wall time (each spends it waiting on the
-network). sqlclient used 2x to 58x less CPU per operation and about a sixth of the memory:
+network). sqlclient used 2x to 63x less CPU per operation and about a sixth of the memory:
 
 | Scenario | sqlclient CPU / op | Microsoft.Data.SqlClient CPU / op | Peak RSS |
 |---|---:|---:|---:|
-| open a connection (TLS, login) | 2.4 ms | 33.9 ms | 16 MB vs 90 MB |
-| `SELECT 1` | 0.15 ms | 8.1 ms | 15 MB vs 94 MB |
-| 100,000 rows, six types | 60 ms | 118 ms | 17 MB vs 103 MB |
-| 1 MB `nvarchar(max)` round trip | 20 ms | 100 ms | 29 MB vs 154 MB |
-| 16 tasks × 25 queries through a pool | 22 ms | 196 ms | 18 MB vs 106 MB |
-| 100 INSERTs as one batch (`SqlBatch`) | 0.47 ms | 27.4 ms | 16 MB vs 94 MB |
-| a 16 MB `varbinary(max)` streamed (`GetStream`) | 17 ms | 124 ms | 16 MB vs 102 MB |
+| open a connection (TLS, login) | 2.0 ms | 40 ms | 16 MB vs 90 MB |
+| `SELECT 1` | 0.10 ms | 6.1 ms | 15 MB vs 97 MB |
+| a parameterized lookup | 0.11 ms | 7.2 ms | 15 MB vs 100 MB |
+| 100,000 rows, six types | 24 ms | 53 ms | 17 MB vs 105 MB |
+| 1 MB `nvarchar(max)` round trip | 12 ms | 64 ms | 28 MB vs 147 MB |
+| 16 tasks × 25 queries through a pool | 15 ms | 122 ms | 19 MB vs 105 MB |
+| 100 INSERTs as one batch (`SqlBatch`) | 0.46 ms | 26 ms | 16 MB vs 94 MB |
+| a 16 MB `varbinary(max)` streamed (`GetStream`) | 13 ms | 79 ms | 15 MB vs 102 MB |
 
 
 [`CEESAFE_FINDINGS.md`](CEESAFE_FINDINGS.md) lists the gaps and bugs in CeeSafe met during the port; all are fixed
