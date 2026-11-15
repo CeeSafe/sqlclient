@@ -88,3 +88,6 @@ run code in a sandbox. The specification is embedded in `ceesafec`, so its answe
 - Live tests need `MSSQL_TEST_CONNECTION` (and `MSSQL_TEST_ACCESS_TOKEN` for Azure SQL with Entra ID, from
   `az account get-access-token --resource https://database.windows.net/`); never write credentials or tokens into
   a file. Run them against both kinds of server when changing the login or the protocol.
+- `tools/live-tests.sh` runs every test suite (offline, SQL Server, Azure SQL); `tools/build-ceesafec.sh` builds the
+  compiler this package needs when the installed one is older. Keep scratch work out of `/tmp`: scripts, results
+  and repros that matter go in `tools/` (see `tools/README.md`).
