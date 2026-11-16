@@ -6,4 +6,5 @@ ceesafec = ">=0.47.1"
 tests = ["tests"]
 
 [dependencies]
-tls = { path = "../../CeeSafeLibs/tls" }
+# pinned by commit (CeeSafe ADR 0152), so a package that depends on sqlclient by git resolves it too
+tls = { git = "https://github.com/CeeSafe/CeeSafeLibs.git", rev = "34b0a54e1fb7c3429c1e1048943a8e04aa68c9b5", dir = "tls" }
