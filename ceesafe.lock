@@ -3,13 +3,13 @@
 [[package]]
 name = "pkey"
 source = "git+https://github.com/CeeSafe/CeeSafeLibs.git"
-commit = "34b0a54e1fb7c3429c1e1048943a8e04aa68c9b5"
+commit = "ca0a13fec248bbe192f0b61b930c8b8259175eed"
 dir = "pkey"
 hash = "sha256:2c20dffa8c0f3b72ab57219e3ce6870be5b27abeb64c3450de8c99e8c44cbc61"
 
 [[package]]
 name = "tls"
 source = "git+https://github.com/CeeSafe/CeeSafeLibs.git"
-commit = "34b0a54e1fb7c3429c1e1048943a8e04aa68c9b5"
+commit = "ca0a13fec248bbe192f0b61b930c8b8259175eed"
 dir = "tls"
 hash = "sha256:3d6287e0531c0a1fa4f916e89a5a895d065b7e3b6a1533a9109fc1432dbf7efb"

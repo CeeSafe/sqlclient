@@ -7,4 +7,4 @@ tests = ["tests"]
 
 [dependencies]
 # pinned by commit (CeeSafe ADR 0152), so a package that depends on sqlclient by git resolves it too
-tls = { git = "https://github.com/CeeSafe/CeeSafeLibs.git", rev = "34b0a54e1fb7c3429c1e1048943a8e04aa68c9b5", dir = "tls" }
+tls = { git = "https://github.com/CeeSafe/CeeSafeLibs.git", rev = "ca0a13fec248bbe192f0b61b930c8b8259175eed", dir = "tls" }
